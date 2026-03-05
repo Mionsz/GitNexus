@@ -152,14 +152,12 @@ describe('Tree-sitter multi-language parsing', () => {
     it('parses class, method, and property declarations', async () => {
       await loadLanguage(SupportedLanguages.CSharp);
       const content = readFixture('simple.cs');
-      try {
-        const { matches } = parseAndQuery(parser, content, LANGUAGE_QUERIES[SupportedLanguages.CSharp]);
-        const defs = extractDefinitions(matches);
-        expect(defs.length).toBeGreaterThan(0);
-      } catch (e: any) {
-        // Some tree-sitter-c-sharp versions don't support all query node types
-        expect(e.message).toContain('TSQueryError');
-      }
+      const { matches } = parseAndQuery(parser, content, LANGUAGE_QUERIES[SupportedLanguages.CSharp]);
+      const defs = extractDefinitions(matches);
+      expect(defs.length).toBeGreaterThan(0);
+      const defTypes = defs.map(d => d.type);
+      expect(defTypes).toContain('definition.class');
+      expect(defTypes).toContain('definition.method');
     });
   });
 

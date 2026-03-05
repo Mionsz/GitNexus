@@ -63,10 +63,18 @@ const ENTRY_POINT_PATTERNS: Record<string, RegExp[]> = {
   
   // C#
   'csharp': [
-    /^(Get|Post|Put|Delete)/,  // ASP.NET conventions
-    /Action$/,                 // MVC actions
-    /^On[A-Z]/,               // Event handlers
-    /Async$/,                 // Async entry points
+    /^(Get|Post|Put|Delete|Patch)/,  // ASP.NET action methods
+    /Action$/,                        // MVC actions
+    /^On[A-Z]/,                      // Event handlers / Blazor lifecycle
+    /Async$/,                        // Async entry points
+    /^Configure$/,                   // Startup.Configure
+    /^ConfigureServices$/,           // Startup.ConfigureServices
+    /^Handle$/,                      // MediatR / generic handler
+    /^Execute$/,                     // Command pattern
+    /^Invoke$/,                      // Middleware Invoke
+    /^Map[A-Z]/,                     // Minimal API MapGet, MapPost
+    /Service$/,                      // Service classes
+    /^Seed/,                         // Database seeding
   ],
   
   // Go
@@ -296,8 +304,13 @@ export function isTestFile(filePath: string): boolean {
     p.endsWith('test.swift') ||
     p.includes('uitests/') ||
     // C# test patterns
+    p.endsWith('tests.cs') ||
+    p.endsWith('test.cs') ||
     p.includes('.tests/') ||
-    p.includes('tests.cs') ||
+    p.includes('.test/') ||
+    p.includes('.integrationtests/') ||
+    p.includes('.unittests/') ||
+    p.includes('/testproject/') ||
     // PHP/Laravel test patterns
     p.endsWith('test.php') ||
     p.endsWith('spec.php') ||

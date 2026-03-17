@@ -5,14 +5,112 @@ import type { SyntaxNode } from '../utils.js';
  *  - 'last':  value type (e.g., V from Map<K,V>) — used for .values(), .items(), .iter() */
 export type TypeArgPosition = 'first' | 'last';
 
-/** Map method names to which type argument they yield.
- *  Methods that iterate/return keys → 'first'; everything else → 'last'. */
-const KEY_METHODS = new Set(['keys', 'keySet', 'Keys']);
+// ---------------------------------------------------------------------------
+// Container type descriptors — maps container base names to type parameter
+// semantics per access method. Replaces the simple KEY_METHODS heuristic.
+//
+// For user-defined generics (MyCache<K,V> extends Map<K,V>), heritage-aware
+// fallback can walk the EXTENDS chain to find a matching descriptor.
+// ---------------------------------------------------------------------------
 
-/** Determine which type arg to use based on the iterator method name.
- *  .keys() / .keySet() → 'first' (key type); everything else → 'last' (value type). */
-export function methodToTypeArgPosition(methodName: string | undefined): TypeArgPosition {
-  return methodName && KEY_METHODS.has(methodName) ? 'first' : 'last';
+/** Describes which type parameter position each access method yields. */
+interface ContainerDescriptor {
+  /** Number of type parameters (1 = single-element, 2 = key-value) */
+  arity: number;
+  /** Methods that yield the first type parameter (key type for maps) */
+  keyMethods: ReadonlySet<string>;
+  /** Methods that yield the last type parameter (value type) */
+  valueMethods: ReadonlySet<string>;
+}
+
+/** Empty set for containers that have no key-yielding methods */
+const NO_KEYS: ReadonlySet<string> = new Set();
+
+/** Standard key-yielding methods across languages */
+const STD_KEY_METHODS: ReadonlySet<string> = new Set(['keys']);
+const JAVA_KEY_METHODS: ReadonlySet<string> = new Set(['keySet']);
+const CSHARP_KEY_METHODS: ReadonlySet<string> = new Set(['Keys']);
+
+/** Standard value-yielding methods across languages */
+const STD_VALUE_METHODS: ReadonlySet<string> = new Set(['values', 'get', 'pop', 'remove']);
+const CSHARP_VALUE_METHODS: ReadonlySet<string> = new Set(['Values', 'TryGetValue']);
+const SINGLE_ELEMENT_METHODS: ReadonlySet<string> = new Set([
+  'iter', 'into_iter', 'iterator', 'get', 'first', 'last', 'pop',
+  'peek', 'poll', 'find', 'filter', 'map',
+]);
+
+const CONTAINER_DESCRIPTORS: ReadonlyMap<string, ContainerDescriptor> = new Map([
+  // --- Map / Dict types (arity 2: key + value) ---
+  ['Map',           { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['WeakMap',       { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['HashMap',       { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['BTreeMap',      { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['LinkedHashMap', { arity: 2, keyMethods: JAVA_KEY_METHODS,   valueMethods: STD_VALUE_METHODS }],
+  ['TreeMap',       { arity: 2, keyMethods: JAVA_KEY_METHODS,   valueMethods: STD_VALUE_METHODS }],
+  ['dict',          { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['Dict',          { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['Dictionary',    { arity: 2, keyMethods: CSHARP_KEY_METHODS, valueMethods: CSHARP_VALUE_METHODS }],
+  ['SortedDictionary', { arity: 2, keyMethods: CSHARP_KEY_METHODS, valueMethods: CSHARP_VALUE_METHODS }],
+  ['Record',        { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['OrderedDict',   { arity: 2, keyMethods: STD_KEY_METHODS,    valueMethods: STD_VALUE_METHODS }],
+  ['ConcurrentHashMap', { arity: 2, keyMethods: JAVA_KEY_METHODS, valueMethods: STD_VALUE_METHODS }],
+  ['ConcurrentDictionary', { arity: 2, keyMethods: CSHARP_KEY_METHODS, valueMethods: CSHARP_VALUE_METHODS }],
+
+  // --- Single-element containers (arity 1) ---
+  ['Array',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['List',      { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['ArrayList', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['LinkedList',{ arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Vec',       { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['VecDeque',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Set',       { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['HashSet',   { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['BTreeSet',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['TreeSet',   { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Queue',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Deque',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Stack',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Sequence',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Iterable',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['Iterator',  { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['IEnumerable', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['IList',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['list',      { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['set',       { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['tuple',     { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+  ['frozenset', { arity: 1, keyMethods: NO_KEYS, valueMethods: SINGLE_ELEMENT_METHODS }],
+]);
+
+/** Determine which type arg to extract based on container type name and access method.
+ *
+ *  Resolution order:
+ *  1. If container is known and method is in keyMethods → 'first'
+ *  2. If container is known with arity 1 → 'last' (same as 'first' for single-arg)
+ *  3. If container is unknown → fall back to method name heuristic
+ *  4. Default: 'last' (value type)
+ */
+export function methodToTypeArgPosition(methodName: string | undefined, containerTypeName?: string): TypeArgPosition {
+  if (containerTypeName) {
+    const desc = CONTAINER_DESCRIPTORS.get(containerTypeName);
+    if (desc) {
+      // Single-element container: always 'last' (= only arg)
+      if (desc.arity === 1) return 'last';
+      // Multi-element: check if method yields key type
+      if (methodName && desc.keyMethods.has(methodName)) return 'first';
+      // Default for multi-element: value type
+      return 'last';
+    }
+  }
+  // Fallback for unknown containers: simple method name heuristic
+  if (methodName && (methodName === 'keys' || methodName === 'keySet' || methodName === 'Keys')) {
+    return 'first';
+  }
+  return 'last';
+}
+
+/** Look up the container descriptor for a type name. Exported for heritage-chain lookups. */
+export function getContainerDescriptor(typeName: string): ContainerDescriptor | undefined {
+  return CONTAINER_DESCRIPTORS.get(typeName);
 }
 
 /**

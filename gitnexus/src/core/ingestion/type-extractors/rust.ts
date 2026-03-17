@@ -383,7 +383,8 @@ const extractForLoopBinding: ForLoopExtractor = (
   }
   if (!iterableName) return;
 
-  const typeArgPos = methodToTypeArgPosition(methodName);
+  const containerTypeName = scopeEnv.get(iterableName);
+  const typeArgPos = methodToTypeArgPosition(methodName, containerTypeName);
   const elementType = resolveIterableElementType(
     iterableName, node, scopeEnv, declarationTypeNodes, scope,
     extractRustElementTypeFromTypeNode, findRustParamElementType,

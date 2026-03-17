@@ -3056,6 +3056,57 @@ fn process(data: HashMap<String, User>) {
     });
   });
 
+  describe('container descriptor-aware type arg selection', () => {
+    it('HashMap.keys() resolves to key type (String) via descriptor', () => {
+      const tree = parse(`
+fn process(data: HashMap<String, User>) {
+    for key in data.keys() {
+        key.len();
+    }
+}
+      `, Rust);
+      const { env } = buildTypeEnv(tree, 'rust');
+      expect(flatGet(env, 'key')).toBe('String');
+    });
+
+    it('HashMap.values() resolves to value type (User) via descriptor', () => {
+      const tree = parse(`
+fn process(data: HashMap<String, User>) {
+    for user in data.values() {
+        user.save();
+    }
+}
+      `, Rust);
+      const { env } = buildTypeEnv(tree, 'rust');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('Vec.iter() resolves to element type (User) — arity 1 always returns last', () => {
+      const tree = parse(`
+fn process(users: Vec<User>) {
+    for user in users.iter() {
+        user.save();
+    }
+}
+      `, Rust);
+      const { env } = buildTypeEnv(tree, 'rust');
+      expect(flatGet(env, 'user')).toBe('User');
+    });
+
+    it('unknown container falls back to last-arg heuristic', () => {
+      // MyCache is not in CONTAINER_DESCRIPTORS, so .keys() still returns first via fallback
+      const tree = parse(`
+function process(cache: MyCache<string, User>) {
+  for (const key of cache.keys()) {
+    key.trim();
+  }
+}
+      `, TypeScript.typescript);
+      const { env } = buildTypeEnv(tree, 'typescript');
+      expect(flatGet(env, 'key')).toBe('string');
+    });
+  });
+
   describe('known limitations (documented skip tests)', () => {
     it.skip('Ruby block parameter: users.each { |user| } — closure param inference, different feature', () => {
       // Not a for-loop; .each { |user| } is a method call with a block.

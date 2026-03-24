@@ -492,6 +492,9 @@ async function runScanAndStructure(
     const cobolResult = processCobol(graph, cobolFiles, allPathSet);
     if (isDev) {
       console.log(`  COBOL: ${cobolResult.programs} programs, ${cobolResult.paragraphs} paragraphs, ${cobolResult.sections} sections from ${cobolFiles.length} files`);
+      if (cobolResult.execSqlBlocks > 0 || cobolResult.execCicsBlocks > 0 || cobolResult.entryPoints > 0) {
+        console.log(`  COBOL enriched: ${cobolResult.execSqlBlocks} SQL blocks, ${cobolResult.execCicsBlocks} CICS blocks, ${cobolResult.entryPoints} entry points, ${cobolResult.moves} moves, ${cobolResult.fileDeclarations} file declarations`);
+      }
       if (cobolResult.jclJobs > 0) {
         console.log(`  JCL: ${cobolResult.jclJobs} jobs, ${cobolResult.jclSteps} steps`);
       }

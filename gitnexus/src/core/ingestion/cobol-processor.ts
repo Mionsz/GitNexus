@@ -48,6 +48,11 @@ export interface CobolProcessResult {
   dataItems: number;
   calls: number;
   copies: number;
+  execSqlBlocks: number;
+  execCicsBlocks: number;
+  entryPoints: number;
+  moves: number;
+  fileDeclarations: number;
   jclJobs: number;
   jclSteps: number;
 }
@@ -91,6 +96,11 @@ export const processCobol = (
     dataItems: 0,
     calls: 0,
     copies: 0,
+    execSqlBlocks: 0,
+    execCicsBlocks: 0,
+    entryPoints: 0,
+    moves: 0,
+    fileDeclarations: 0,
     jclJobs: 0,
     jclSteps: 0,
   };
@@ -161,12 +171,37 @@ export const processCobol = (
     result.dataItems += extracted.dataItems.length;
     result.calls += extracted.calls.length;
     result.copies += extracted.copies.length;
+    result.execSqlBlocks += extracted.execSqlBlocks.length;
+    result.execCicsBlocks += extracted.execCicsBlocks.length;
+    result.entryPoints += extracted.entryPoints.length;
+    result.moves += extracted.moves.length;
+    result.fileDeclarations += extracted.fileDeclarations.length;
   }
 
   // ── 4. Second pass: resolve cross-program CALL targets ─────────────
-  // Now that all modules are registered, create CALLS edges for
-  // unresolved CALL targets that match a known module name.
-  // (Already handled inline during mapToGraph via moduleNodeIds)
+  // During mapToGraph, early programs create unresolved CALL edges
+  // (target = <unresolved>:PROGNAME) because later programs haven't
+  // been registered in moduleNodeIds yet. Now that ALL programs are
+  // processed, re-scan unresolved CALLS edges and patch them.
+  graph.forEachRelationship(rel => {
+    if (rel.type === 'CALLS' && rel.reason?.startsWith('cobol-call-unresolved')) {
+      // Extract the program name from the synthetic target ID
+      const match = rel.targetId.match(/<unresolved>:(.+)/);
+      if (!match) return;
+      const resolvedId = moduleNodeIds.get(match[1]);
+      if (resolvedId) {
+        // Replace with resolved edge (can't mutate, so add new + mark old)
+        graph.addRelationship({
+          id: rel.id + ':resolved',
+          type: 'CALLS',
+          sourceId: rel.sourceId,
+          targetId: resolvedId,
+          confidence: 0.95,
+          reason: 'cobol-call',
+        });
+      }
+    }
+  });
 
   // ── 5. Process JCL files ───────────────────────────────────────────
   if (jclFiles.length > 0) {
@@ -186,6 +221,17 @@ export const processCobol = (
 // ---------------------------------------------------------------------------
 // Graph mapping
 // ---------------------------------------------------------------------------
+
+/** Resolve a data item name to its Property node id, if it exists and is not FILLER. */
+function findDataItemNode(
+  name: string,
+  dataItems: CobolRegexResults['dataItems'],
+  filePath: string,
+): string | undefined {
+  const item = dataItems.find(d => d.name.toUpperCase() === name.toUpperCase());
+  if (!item || item.name === 'FILLER') return undefined;
+  return generateId('Property', `${filePath}:${item.name}`);
+}
 
 function mapToGraph(
   graph: KnowledgeGraph,
@@ -336,6 +382,22 @@ function mapToGraph(
       confidence: 1.0,
       reason: 'cobol-perform',
     });
+
+    // PERFORM THRU -> expanded CALLS edge to thru target
+    if (perf.thruTarget) {
+      const thruTargetId = paraNodeIds.get(perf.thruTarget.toUpperCase())
+        ?? sectionNodeIds.get(perf.thruTarget.toUpperCase());
+      if (thruTargetId && thruTargetId !== targetId) {
+        graph.addRelationship({
+          id: generateId('CALLS', `${sourceId}->perform-thru->${thruTargetId}:L${perf.line}`),
+          type: 'CALLS',
+          sourceId,
+          targetId: thruTargetId,
+          confidence: 1.0,
+          reason: 'cobol-perform-thru',
+        });
+      }
+    }
   }
 
   // ── CALL -> CALLS relationship (cross-program) ──────────────────
@@ -366,6 +428,164 @@ function mapToGraph(
       targetId: targetFileId,
       confidence: 1.0,
       reason: 'cobol-copy',
+    });
+  }
+
+  // ── EXEC SQL blocks -> CodeElement nodes + ACCESSES edges ──────
+  for (const sql of extracted.execSqlBlocks) {
+    const sqlId = generateId('CodeElement', `${filePath}:exec-sql:L${sql.line}`);
+    graph.addNode({
+      id: sqlId,
+      label: 'CodeElement',
+      properties: {
+        name: `EXEC SQL ${sql.operation}`,
+        filePath,
+        startLine: sql.line,
+        endLine: sql.line,
+        language: 'cobol' as any,
+        description: `tables:[${sql.tables.join(',')}] cursors:[${sql.cursors.join(',')}]`,
+      },
+    });
+    graph.addRelationship({
+      id: generateId('CONTAINS', `${parentId}->${sqlId}`),
+      type: 'CONTAINS',
+      sourceId: parentId,
+      targetId: sqlId,
+      confidence: 1.0,
+      reason: 'cobol-exec-sql',
+    });
+    // ACCESSES edges to tables
+    for (const table of sql.tables) {
+      const tableId = generateId('Record', `<db>:${table}`);
+      graph.addRelationship({
+        id: generateId('ACCESSES', `${sqlId}->${tableId}:${sql.operation}`),
+        type: 'ACCESSES',
+        sourceId: sqlId,
+        targetId: tableId,
+        confidence: 0.9,
+        reason: `sql-${sql.operation.toLowerCase()}`,
+      });
+    }
+  }
+
+  // ── EXEC CICS blocks -> CodeElement nodes + CALLS edges ────────
+  for (const cics of extracted.execCicsBlocks) {
+    const cicsId = generateId('CodeElement', `${filePath}:exec-cics:L${cics.line}`);
+    graph.addNode({
+      id: cicsId,
+      label: 'CodeElement',
+      properties: {
+        name: `EXEC CICS ${cics.command}`,
+        filePath,
+        startLine: cics.line,
+        endLine: cics.line,
+        language: 'cobol' as any,
+        description: cics.mapName ? `map:${cics.mapName}` : cics.programName ? `program:${cics.programName}` : undefined,
+      },
+    });
+    graph.addRelationship({
+      id: generateId('CONTAINS', `${parentId}->${cicsId}`),
+      type: 'CONTAINS',
+      sourceId: parentId,
+      targetId: cicsId,
+      confidence: 1.0,
+      reason: 'cobol-exec-cics',
+    });
+    // LINK/XCTL -> cross-program CALLS
+    if (cics.programName && (cics.command === 'LINK' || cics.command === 'XCTL')) {
+      const targetId = moduleNodeIds.get(cics.programName.toUpperCase())
+        ?? generateId('Module', `<unresolved>:${cics.programName.toUpperCase()}`);
+      graph.addRelationship({
+        id: generateId('CALLS', `${parentId}->cics-${cics.command.toLowerCase()}->${cics.programName}:L${cics.line}`),
+        type: 'CALLS',
+        sourceId: parentId,
+        targetId,
+        confidence: 0.95,
+        reason: `cics-${cics.command.toLowerCase()}`,
+      });
+    }
+  }
+
+  // ── ENTRY points -> Constructor nodes ──────────────────────────
+  for (const entry of extracted.entryPoints) {
+    const entryId = generateId('Constructor', `${filePath}:${entry.name}`);
+    graph.addNode({
+      id: entryId,
+      label: 'Constructor',
+      properties: {
+        name: entry.name,
+        filePath,
+        startLine: entry.line,
+        endLine: entry.line,
+        language: 'cobol' as any,
+        isExported: true,
+        description: entry.parameters.length > 0 ? `using:${entry.parameters.join(',')}` : undefined,
+      },
+    });
+    graph.addRelationship({
+      id: generateId('CONTAINS', `${parentId}->${entryId}`),
+      type: 'CONTAINS',
+      sourceId: parentId,
+      targetId: entryId,
+      confidence: 1.0,
+      reason: 'cobol-entry-point',
+    });
+    // Register in moduleNodeIds for cross-program resolution
+    moduleNodeIds.set(entry.name.toUpperCase(), entryId);
+  }
+
+  // ── MOVE data flow -> ACCESSES edges (read/write) ──────────────
+  for (const move of extracted.moves) {
+    const fromPropId = findDataItemNode(move.from, extracted.dataItems, filePath);
+    const toPropId = findDataItemNode(move.to, extracted.dataItems, filePath);
+    const callerId = move.caller
+      ? (paraNodeIds.get(move.caller.toUpperCase()) ?? parentId)
+      : parentId;
+
+    if (fromPropId) {
+      graph.addRelationship({
+        id: generateId('ACCESSES', `${callerId}->read->${move.from}:L${move.line}`),
+        type: 'ACCESSES',
+        sourceId: callerId,
+        targetId: fromPropId,
+        confidence: 0.9,
+        reason: move.corresponding ? 'cobol-move-corresponding-read' : 'cobol-move-read',
+      });
+    }
+    if (toPropId) {
+      graph.addRelationship({
+        id: generateId('ACCESSES', `${callerId}->write->${move.to}:L${move.line}`),
+        type: 'ACCESSES',
+        sourceId: callerId,
+        targetId: toPropId,
+        confidence: 0.9,
+        reason: move.corresponding ? 'cobol-move-corresponding-write' : 'cobol-move-write',
+      });
+    }
+  }
+
+  // ── File declarations -> Record nodes ──────────────────────────
+  for (const fd of extracted.fileDeclarations) {
+    const fdId = generateId('Record', `${filePath}:${fd.selectName}`);
+    graph.addNode({
+      id: fdId,
+      label: 'Record',
+      properties: {
+        name: fd.selectName,
+        filePath,
+        startLine: fd.line,
+        endLine: fd.line,
+        language: 'cobol' as any,
+        description: `assign:${fd.assignTo}${fd.organization ? ` org:${fd.organization}` : ''}${fd.access ? ` access:${fd.access}` : ''}`,
+      },
+    });
+    graph.addRelationship({
+      id: generateId('CONTAINS', `${parentId}->${fdId}`),
+      type: 'CONTAINS',
+      sourceId: parentId,
+      targetId: fdId,
+      confidence: 1.0,
+      reason: 'cobol-file-declaration',
     });
   }
 }

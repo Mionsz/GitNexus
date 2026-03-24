@@ -19,3 +19,7 @@
            STRING 'Customer ' LS-CUST-ID ' amount ' LS-AMOUNT
                DELIMITED BY SIZE INTO WS-LOG-MESSAGE
            DISPLAY WS-LOG-MESSAGE.
+
+       ENTRY "AUDITLOG-BATCH" USING LS-CUST-ID.
+           DISPLAY 'Batch audit for ' LS-CUST-ID
+           GOBACK.

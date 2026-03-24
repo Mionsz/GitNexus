@@ -34,3 +34,7 @@
            EXEC CICS
                LINK PROGRAM('AUDITLOG')
            END-EXEC.
+
+           EXEC CICS
+               XCTL PROGRAM('CUSTUPDT')
+           END-EXEC.

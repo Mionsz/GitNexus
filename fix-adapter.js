@@ -22,7 +22,7 @@ if (c.includes(oldUpsert)) {
   console.log('Pattern not found - checking file...');
   // Show context around the area
   const lines = c.split('\n');
-  const idx = lines.findIndex(l => l.includes("} else if (label === 'Folder')"));
+  const idx = lines.findIndex((l) => l.includes("} else if (label === 'Folder')"));
   if (idx >= 0) {
     console.log('Found Folder case at line', idx + 1);
     for (let i = idx; i < idx + 10; i++) console.log(lines[i]);

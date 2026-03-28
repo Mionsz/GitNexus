@@ -1,9 +1,9 @@
 /**
  * LLM Client for Wiki Generation
- * 
+ *
  * OpenAI-compatible API client using native fetch.
  * Supports OpenAI, Azure, LiteLLM, Ollama, and any OpenAI-compatible endpoint.
- * 
+ *
  * Config priority: CLI flags > env vars > defaults
  */
 
@@ -32,36 +32,38 @@ export interface LLMResponse {
 /**
  * Resolve LLM configuration from env vars, saved config, and optional overrides.
  * Priority: overrides (CLI flags) > env vars > ~/.gitnexus/config.json > error
- * 
+ *
  * If no API key is found, returns config with empty apiKey (caller should handle).
  */
 export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<LLMConfig> {
   const { loadCLIConfig } = await import('../../storage/repo-manager.js');
   const savedConfig = await loadCLIConfig();
 
-  const apiKey = overrides?.apiKey
-    || process.env.GITNEXUS_API_KEY
-    || process.env.OPENAI_API_KEY
-    || savedConfig.apiKey
-    || '';
+  const apiKey =
+    overrides?.apiKey ||
+    process.env.GITNEXUS_API_KEY ||
+    process.env.OPENAI_API_KEY ||
+    savedConfig.apiKey ||
+    '';
 
   return {
     apiKey,
-    baseUrl: overrides?.baseUrl
-      || process.env.GITNEXUS_LLM_BASE_URL
-      || savedConfig.baseUrl
-      || 'https://openrouter.ai/api/v1',
-    model: overrides?.model
-      || process.env.GITNEXUS_MODEL
-      || (savedConfig.provider === 'cursor' ? savedConfig.cursorModel : undefined)
-      || savedConfig.model
-      || 'minimax/minimax-m2.5',
+    baseUrl:
+      overrides?.baseUrl ||
+      process.env.GITNEXUS_LLM_BASE_URL ||
+      savedConfig.baseUrl ||
+      'https://openrouter.ai/api/v1',
+    model:
+      overrides?.model ||
+      process.env.GITNEXUS_MODEL ||
+      (savedConfig.provider === 'cursor' ? savedConfig.cursorModel : undefined) ||
+      savedConfig.model ||
+      'minimax/minimax-m2.5',
     maxTokens: overrides?.maxTokens ?? 16_384,
     temperature: overrides?.temperature ?? 0,
     provider: overrides?.provider ?? savedConfig.provider ?? 'openai',
-    apiVersion: overrides?.apiVersion
-      || process.env.GITNEXUS_AZURE_API_VERSION
-      || savedConfig.apiVersion,
+    apiVersion:
+      overrides?.apiVersion || process.env.GITNEXUS_AZURE_API_VERSION || savedConfig.apiVersion,
     isReasoningModel: overrides?.isReasoningModel ?? savedConfig.isReasoningModel,
   };
 }
@@ -133,7 +135,9 @@ export async function callLLM(
 
   // Warn when using Azure legacy deployment URL without api-version
   if (azure && !config.apiVersion && config.baseUrl.includes('/deployments/')) {
-    console.warn('[gitnexus] Warning: Azure legacy deployment URL detected but no api-version set. Add --api-version 2024-10-21 or use the v1 API format.');
+    console.warn(
+      '[gitnexus] Warning: Azure legacy deployment URL detected but no api-version set. Add --api-version 2024-10-21 or use the v1 API format.',
+    );
   }
 
   // Detect reasoning model (o1, o3, o4-mini etc.) or explicit override
@@ -161,7 +165,7 @@ export async function callLLM(
   // Build auth headers — Azure uses api-key header, everyone else uses Authorization: Bearer
   const authHeaders: Record<string, string> = azure
     ? { 'api-key': config.apiKey }
-    : { 'Authorization': `Bearer ${config.apiKey}` };
+    : { Authorization: `Bearer ${config.apiKey}` };
 
   const MAX_RETRIES = 3;
   let lastError: Error | null = null;
@@ -181,16 +185,21 @@ export async function callLLM(
         const errorText = await response.text().catch(() => 'unknown error');
 
         // Azure content filter — surface a clear message instead of a generic API error
-        if (azure && response.status === 400 && (
-          errorText.includes('content_filter') || errorText.includes('ResponsibleAIPolicyViolation')
-        )) {
-          throw new Error(`Azure content filter blocked this request. The prompt triggered content policy. Details: ${errorText.slice(0, 300)}`);
+        if (
+          azure &&
+          response.status === 400 &&
+          (errorText.includes('content_filter') ||
+            errorText.includes('ResponsibleAIPolicyViolation'))
+        ) {
+          throw new Error(
+            `Azure content filter blocked this request. The prompt triggered content policy. Details: ${errorText.slice(0, 300)}`,
+          );
         }
 
         // Rate limit — wait with exponential backoff and retry
         if (response.status === 429 && attempt < MAX_RETRIES - 1) {
           const retryAfter = parseInt(response.headers.get('retry-after') || '0', 10);
-          const delay = retryAfter > 0 ? retryAfter * 1000 : (2 ** attempt) * 3000;
+          const delay = retryAfter > 0 ? retryAfter * 1000 : 2 ** attempt * 3000;
           await sleep(delay);
           continue;
         }
@@ -210,7 +219,7 @@ export async function callLLM(
       }
 
       // Non-streaming path
-      const json = await response.json() as any;
+      const json = (await response.json()) as any;
       const choice = json.choices?.[0];
       if (!choice?.message?.content) {
         throw new Error('LLM returned empty response');
@@ -225,7 +234,10 @@ export async function callLLM(
       lastError = err;
 
       // Network error — retry with backoff
-      if (attempt < MAX_RETRIES - 1 && (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.message?.includes('fetch'))) {
+      if (
+        attempt < MAX_RETRIES - 1 &&
+        (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.message?.includes('fetch'))
+      ) {
         await sleep((attempt + 1) * 3000);
         continue;
       }
@@ -286,7 +298,9 @@ async function readSSEStream(
   }
 
   if (contentFilterTriggered) {
-    throw new Error('content filter triggered mid-stream. The generated content was blocked by content policy. Adjust your prompt and retry.');
+    throw new Error(
+      'content filter triggered mid-stream. The generated content was blocked by content policy. Adjust your prompt and retry.',
+    );
   }
 
   if (!content) {
@@ -297,5 +311,5 @@ async function readSSEStream(
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

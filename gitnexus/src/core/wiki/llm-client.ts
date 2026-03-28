@@ -1,9 +1,9 @@
 /**
  * LLM Client for Wiki Generation
- *
+ * 
  * OpenAI-compatible API client using native fetch.
  * Supports OpenAI, Azure, LiteLLM, Ollama, and any OpenAI-compatible endpoint.
- *
+ * 
  * Config priority: CLI flags > env vars > defaults
  */
 
@@ -15,7 +15,12 @@ export interface LLMConfig {
   model: string;
   maxTokens: number;
   temperature: number;
-  provider?: LLMProvider;
+  /** Provider type — controls auth header behaviour */
+  provider?: 'openai' | 'openrouter' | 'azure' | 'custom' | 'cursor';
+  /** Azure api-version query param (e.g. '2024-10-21'). Appended to URL when set. */
+  apiVersion?: string;
+  /** When true, strips sampling params and uses max_completion_tokens instead of max_tokens */
+  isReasoningModel?: boolean;
 }
 
 export interface LLMResponse {
@@ -27,43 +32,36 @@ export interface LLMResponse {
 /**
  * Resolve LLM configuration from env vars, saved config, and optional overrides.
  * Priority: overrides (CLI flags) > env vars > ~/.gitnexus/config.json > error
- *
+ * 
  * If no API key is found, returns config with empty apiKey (caller should handle).
  */
 export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<LLMConfig> {
   const { loadCLIConfig } = await import('../../storage/repo-manager.js');
   const savedConfig = await loadCLIConfig();
 
-  const provider = overrides?.provider || savedConfig.provider || 'openai';
-
-  const apiKey =
-    overrides?.apiKey ||
-    process.env.GITNEXUS_API_KEY ||
-    process.env.OPENAI_API_KEY ||
-    savedConfig.apiKey ||
-    '';
-
-  // For cursor provider, only use model if explicitly provided (default is 'auto' handled by CLI)
-  // For openai provider, use model with fallback to default
-  const model =
-    provider === 'cursor'
-      ? overrides?.model || savedConfig.cursorModel || ''
-      : overrides?.model ||
-        process.env.GITNEXUS_MODEL ||
-        savedConfig.model ||
-        'minimax/minimax-m2.5';
+  const apiKey = overrides?.apiKey
+    || process.env.GITNEXUS_API_KEY
+    || process.env.OPENAI_API_KEY
+    || savedConfig.apiKey
+    || '';
 
   return {
     apiKey,
-    baseUrl:
-      overrides?.baseUrl ||
-      process.env.GITNEXUS_LLM_BASE_URL ||
-      savedConfig.baseUrl ||
-      'https://openrouter.ai/api/v1',
-    model,
+    baseUrl: overrides?.baseUrl
+      || process.env.GITNEXUS_LLM_BASE_URL
+      || savedConfig.baseUrl
+      || 'https://openrouter.ai/api/v1',
+    model: overrides?.model
+      || process.env.GITNEXUS_MODEL
+      || savedConfig.model
+      || 'minimax/minimax-m2.5',
     maxTokens: overrides?.maxTokens ?? 16_384,
     temperature: overrides?.temperature ?? 0,
-    provider,
+    provider: overrides?.provider ?? savedConfig.provider,
+    apiVersion: overrides?.apiVersion
+      || process.env.GITNEXUS_AZURE_API_VERSION
+      || savedConfig.apiVersion,
+    isReasoningModel: overrides?.isReasoningModel ?? savedConfig.isReasoningModel,
   };
 }
 
@@ -72,6 +70,31 @@ export async function resolveLLMConfig(overrides?: Partial<LLMConfig>): Promise<
  */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+/**
+ * Returns true if the given base URL is an Azure OpenAI endpoint.
+ */
+export function isAzureProvider(baseUrl: string): boolean {
+  return baseUrl.includes('.openai.azure.com') || baseUrl.includes('.services.ai.azure.com');
+}
+
+/**
+ * Returns true if the model name matches a known reasoning model pattern,
+ * or if the explicit override is true.
+ * Pass override=false to force non-reasoning even for o-series names.
+ */
+export function isReasoningModel(model: string, override?: boolean): boolean {
+  if (override !== undefined) return override;
+  return /^o[1-9](-mini|-preview)?$|^o[1-9]$|^o\d+-mini$/i.test(model);
+}
+
+/**
+ * Build the full chat completions URL, appending ?api-version when provided.
+ */
+export function buildRequestUrl(baseUrl: string, apiVersion: string | undefined): string {
+  const base = `${baseUrl.replace(/\/+$/, '')}/chat/completions`;
+  return apiVersion ? `${base}?api-version=${apiVersion}` : base;
 }
 
 export interface CallLLMOptions {
@@ -115,7 +138,7 @@ export async function callLLM(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${config.apiKey}`,
+          'Authorization': `Bearer ${config.apiKey}`,
         },
         body: JSON.stringify(body),
       });
@@ -126,7 +149,7 @@ export async function callLLM(
         // Rate limit — wait with exponential backoff and retry
         if (response.status === 429 && attempt < MAX_RETRIES - 1) {
           const retryAfter = parseInt(response.headers.get('retry-after') || '0', 10);
-          const delay = retryAfter > 0 ? retryAfter * 1000 : 2 ** attempt * 3000;
+          const delay = retryAfter > 0 ? retryAfter * 1000 : (2 ** attempt) * 3000;
           await sleep(delay);
           continue;
         }
@@ -146,7 +169,7 @@ export async function callLLM(
       }
 
       // Non-streaming path
-      const json = (await response.json()) as any;
+      const json = await response.json() as any;
       const choice = json.choices?.[0];
       if (!choice?.message?.content) {
         throw new Error('LLM returned empty response');
@@ -161,10 +184,7 @@ export async function callLLM(
       lastError = err;
 
       // Network error — retry with backoff
-      if (
-        attempt < MAX_RETRIES - 1 &&
-        (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.message?.includes('fetch'))
-      ) {
+      if (attempt < MAX_RETRIES - 1 && (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.message?.includes('fetch'))) {
         await sleep((attempt + 1) * 3000);
         continue;
       }
@@ -223,5 +243,5 @@ async function readSSEStream(
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }

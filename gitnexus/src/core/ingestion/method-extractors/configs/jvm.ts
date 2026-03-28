@@ -78,7 +78,10 @@ function extractJavaParameters(node: SyntaxNode): ParameterInfo[] {
         } else if (
           c.type === 'type_identifier' ||
           c.type === 'generic_type' ||
-          c.type === 'scoped_type_identifier'
+          c.type === 'scoped_type_identifier' ||
+          c.type === 'integral_type' ||
+          c.type === 'floating_point_type' ||
+          c.type === 'boolean_type'
         ) {
           paramType = extractSimpleTypeName(c) ?? c.text?.trim();
         }
@@ -105,7 +108,12 @@ export const javaMethodConfig: MethodExtractionConfig = {
     'record_declaration',
     'annotation_type_declaration',
   ],
-  methodNodeTypes: ['method_declaration', 'constructor_declaration'],
+  methodNodeTypes: [
+    'method_declaration',
+    'constructor_declaration',
+    'compact_constructor_declaration',
+    'annotation_type_element_declaration',
+  ],
   bodyNodeTypes: [
     'class_body',
     'interface_body',
@@ -161,13 +169,25 @@ function extractKotlinParameters(node: SyntaxNode): ParameterInfo[] {
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
     if (child && child.type === 'function_value_parameters') {
+      let nextIsVariadic = false;
       for (let j = 0; j < child.namedChildCount; j++) {
         const param = child.namedChild(j);
-        if (!param || param.type !== 'parameter') continue;
+        if (!param) continue;
+        // parameter_modifiers containing vararg precedes the parameter node
+        if (param.type === 'parameter_modifiers') {
+          for (let m = 0; m < param.namedChildCount; m++) {
+            const mod = param.namedChild(m);
+            if (mod && mod.text === 'vararg') nextIsVariadic = true;
+          }
+          continue;
+        }
+        if (param.type !== 'parameter') continue;
 
         let paramName: string | undefined;
         let paramType: string | null = null;
         let hasDefault = false;
+        const isVariadic = nextIsVariadic;
+        nextIsVariadic = false;
 
         for (let k = 0; k < param.namedChildCount; k++) {
           const part = param.namedChild(k);
@@ -197,7 +217,7 @@ function extractKotlinParameters(node: SyntaxNode): ParameterInfo[] {
             name: paramName,
             type: paramType,
             isOptional: hasDefault,
-            isVariadic: false, // Kotlin uses vararg keyword, handled separately
+            isVariadic: isVariadic,
           });
         }
       }

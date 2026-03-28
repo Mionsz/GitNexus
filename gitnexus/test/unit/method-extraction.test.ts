@@ -290,6 +290,59 @@ describe('Java MethodExtractor', () => {
     });
   });
 
+  describe('extract from annotation type', () => {
+    it('extracts annotation element declarations', () => {
+      const tree = parseJava(`
+        public @interface MyAnnotation {
+          String value();
+          int count() default 0;
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, javaCtx);
+
+      expect(result).not.toBeNull();
+      expect(result!.ownerFqn).toBe('MyAnnotation');
+      expect(result!.methods).toHaveLength(2);
+      expect(result!.methods.map((m) => m.name).sort()).toEqual(['count', 'value']);
+    });
+  });
+
+  describe('extract from record', () => {
+    it('extracts compact constructor', () => {
+      const tree = parseJava(`
+        public record Point(int x, int y) {
+          public Point {
+            if (x < 0) throw new IllegalArgumentException();
+          }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, javaCtx);
+
+      expect(result).not.toBeNull();
+      const ctor = result!.methods.find((m) => m.name === 'Point');
+      expect(ctor).toBeDefined();
+    });
+  });
+
+  describe('extract primitive varargs', () => {
+    it('extracts int... vararg type', () => {
+      const tree = parseJava(`
+        public class MathUtils {
+          public int sum(int... nums) { return 0; }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, javaCtx);
+
+      const m = result!.methods[0];
+      expect(m.parameters).toHaveLength(1);
+      expect(m.parameters[0].type).toBe('int');
+      expect(m.parameters[0].isVariadic).toBe(true);
+    });
+  });
+
   describe('no methods', () => {
     it('returns null for class with no methods', () => {
       const tree = parseJava(`
@@ -352,6 +405,24 @@ describeKotlin('Kotlin MethodExtractor', () => {
       const m = result!.methods.find((m) => m.name === 'helper');
       expect(m).toBeDefined();
       expect(m!.visibility).toBe('private');
+    });
+  });
+
+  describe('extract vararg parameter', () => {
+    it('detects vararg as isVariadic', () => {
+      const tree = parseKotlin(`
+        class Logger {
+          fun log(vararg messages: String) { }
+        }
+      `);
+      const classNode = tree.rootNode.child(0)!;
+      const result = extractor.extract(classNode, kotlinCtx);
+
+      expect(result).not.toBeNull();
+      const m = result!.methods[0];
+      expect(m.parameters).toHaveLength(1);
+      expect(m.parameters[0].name).toBe('messages');
+      expect(m.parameters[0].isVariadic).toBe(true);
     });
   });
 

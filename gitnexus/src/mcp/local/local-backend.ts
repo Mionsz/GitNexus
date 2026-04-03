@@ -1914,8 +1914,8 @@ export class LocalBackend {
     const { target, direction } = params;
     const maxDepth = params.maxDepth || 3;
     // Map legacy relation type names before filtering (backward compat for OVERRIDES → METHOD_OVERRIDES)
-    const mappedRelTypes = params.relationTypes?.map((t: string) =>
-      t === 'OVERRIDES' ? 'METHOD_OVERRIDES' : t,
+    const mappedRelTypes = params.relationTypes?.flatMap((t: string) =>
+      t === 'OVERRIDES' ? ['OVERRIDES', 'METHOD_OVERRIDES'] : [t],
     );
     const rawRelTypes =
       mappedRelTypes && mappedRelTypes.length > 0

@@ -472,6 +472,15 @@ function parameterTypesMatch(
 
 /**
  * For each concrete class that implements/extends an interface or trait,
+ *
+ * **Known limitation — overloaded methods:** The parameterTypes/arity matching
+ * logic is correct for the data it receives, but the graph model collapses
+ * overloaded methods (same name in same class) into a single node keyed by
+ * `filePath:ClassName.methodName`. Until overloads get distinct node IDs
+ * (separate RFC, see issue #574 Known Limitations), METHOD_IMPLEMENTS edges
+ * for overloaded interfaces may attach to whichever overload was parsed first.
+ * The arity-compatible matching and confidence tiering mitigate but do not
+ * eliminate this — real disambiguation requires first-class overload nodes.
  * find methods in the class that implement methods defined in the interface
  * and emit METHOD_IMPLEMENTS edges: ConcreteMethod → InterfaceMethod.
  */
@@ -740,6 +749,11 @@ function findInheritedMethod(
     const ifaceId = implBfsQueue.shift()!;
     if (implVisited.has(ifaceId)) continue;
     implVisited.add(ifaceId);
+
+    // Only process Interface/Trait nodes — Dart `implements Class` does not
+    // inherit method bodies, so Class/Struct/Enum parents must be skipped.
+    const ifaceNode = graph.getNode(ifaceId);
+    if (!ifaceNode || (ifaceNode.label !== 'Interface' && ifaceNode.label !== 'Trait')) continue;
 
     // Check this interface/trait's methods for a non-abstract default
     const methods = methodMap.get(ifaceId) ?? [];

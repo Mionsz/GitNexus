@@ -1811,3 +1811,49 @@ describe('Kotlin method enrichment', () => {
     expect(classifyCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Interface dispatch: METHOD_IMPLEMENTS edges from concrete → interface methods
+// Repository interface with find/save, SqlRepository implements them
+// ---------------------------------------------------------------------------
+
+describe('Kotlin interface dispatch (METHOD_IMPLEMENTS)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'kotlin-interface-dispatch'), () => {});
+  }, 60000);
+
+  it('detects Repository interface and SqlRepository class', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    const ifaces = getNodesByLabel(result, 'Interface');
+    expect(classes).toContain('SqlRepository');
+    expect(ifaces).toContain('Repository');
+  });
+
+  it('emits IMPLEMENTS edge SqlRepository → Repository', () => {
+    const impl = getRelationships(result, 'IMPLEMENTS');
+    const edge = impl.find((e) => e.source === 'SqlRepository' && e.target === 'Repository');
+    expect(edge).toBeDefined();
+  });
+
+  it('emits METHOD_IMPLEMENTS edges for find and save', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const findEdge = mi.find(
+      (e) =>
+        e.source === 'find' &&
+        e.target === 'find' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('Repository'),
+    );
+    const saveEdge = mi.find(
+      (e) =>
+        e.source === 'save' &&
+        e.target === 'save' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('Repository'),
+    );
+    expect(findEdge).toBeDefined();
+    expect(saveEdge).toBeDefined();
+  });
+});

@@ -337,7 +337,17 @@ export const findEnclosingClassInfo = (
             c.type === 'constant',
         );
       if (nameNode) {
-        const label = CONTAINER_TYPE_TO_LABEL[current.type] || 'Class';
+        let label = CONTAINER_TYPE_TO_LABEL[current.type] || 'Class';
+        // Kotlin: class_declaration with an anonymous "interface" keyword child
+        // is actually an interface, not a class. Refine the label to match the
+        // node ID generated from the tree-sitter query capture (@definition.interface).
+        if (
+          current.type === 'class_declaration' &&
+          label === 'Class' &&
+          current.children?.some((c: SyntaxNode) => c.type === 'interface')
+        ) {
+          label = 'Interface';
+        }
         return {
           classId: generateId(label, `${filePath}:${nameNode.text}`),
           className: nameNode.text,

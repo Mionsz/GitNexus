@@ -1722,3 +1722,48 @@ describe('C# method enrichment', () => {
     expect(classifyCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Interface dispatch: METHOD_IMPLEMENTS edges
+// ---------------------------------------------------------------------------
+
+describe('C# interface dispatch (METHOD_IMPLEMENTS)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'csharp-interface-dispatch'), () => {});
+  }, 60000);
+
+  it('detects IRepository interface and SqlRepository class', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    const ifaces = getNodesByLabel(result, 'Interface');
+    expect(classes).toContain('SqlRepository');
+    expect(ifaces).toContain('IRepository');
+  });
+
+  it('emits IMPLEMENTS edge SqlRepository → IRepository', () => {
+    const impl = getRelationships(result, 'IMPLEMENTS');
+    const edge = impl.find((e) => e.source === 'SqlRepository' && e.target === 'IRepository');
+    expect(edge).toBeDefined();
+  });
+
+  it('emits METHOD_IMPLEMENTS edges for Find and Save', () => {
+    const mi = getRelationships(result, 'METHOD_IMPLEMENTS');
+    const findEdge = mi.find(
+      (e) =>
+        e.source === 'Find' &&
+        e.target === 'Find' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('IRepository'),
+    );
+    const saveEdge = mi.find(
+      (e) =>
+        e.source === 'Save' &&
+        e.target === 'Save' &&
+        e.sourceFilePath.includes('SqlRepository') &&
+        e.targetFilePath.includes('IRepository'),
+    );
+    expect(findEdge).toBeDefined();
+    expect(saveEdge).toBeDefined();
+  });
+});

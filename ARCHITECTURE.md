@@ -73,12 +73,20 @@ same parameter count but differ only in types (e.g. `save(int)` vs
 enhancement may add type-hash disambiguation for languages with reliable type
 extraction (see issue #574).
 
+**Variadic method matching:** When one side is variadic (`parameterCount`
+undefined) and the other has a fixed count, `METHOD_IMPLEMENTS` edges are
+emitted with confidence 0.7 instead of 1.0. Variadic methods like
+`foo(String... args)` may superficially match `foo(String s)` by type but
+are not guaranteed to be interchangeable across all languages (Java/Kotlin
+accept this via varargs sugar; TypeScript, C#, Rust do not).
+
 **Confidence tiering** for `METHOD_IMPLEMENTS` edges:
 
 | Match quality | Confidence | When |
 |---|---|---|
 | Exact parameter types match | 1.0 | Both sides have `parameterTypes` arrays and they match |
 | Arity (count) matches | 1.0 | Both sides have `parameterCount`, types unavailable |
+| Variadic vs fixed | 0.7 | One side is variadic, other has fixed count |
 | Lenient (insufficient info) | 0.7 | One or both sides lack type and count data |
 
 ## Related docs

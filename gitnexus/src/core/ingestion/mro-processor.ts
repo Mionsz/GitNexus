@@ -290,6 +290,10 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
   let overrideEdges = 0;
   let ambiguityCount = 0;
 
+  // Pre-computed maps to avoid redundant BFS in emitMethodImplementsEdges
+  const ancestorsMap = new Map<string, string[]>();
+  const edgeTypesMap = new Map<string, Map<string, 'EXTENDS' | 'IMPLEMENTS'>>();
+
   // Process every class that has at least one parent
   for (const [classId, directParents] of parentMap) {
     if (directParents.length === 0) continue;
@@ -303,12 +307,16 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
 
     // Compute linearized MRO depending on language strategy
     const provider = getProvider(language);
+    const ancestors = gatherAncestors(classId, parentMap);
+    ancestorsMap.set(classId, ancestors);
+    edgeTypesMap.set(classId, buildTransitiveEdgeTypes(classId, parentMap, parentEdgeType));
+
     let mroOrder: string[];
     if (provider.mroStrategy === 'c3') {
       const c3Result = c3Linearize(classId, parentMap, c3Cache);
-      mroOrder = c3Result ?? gatherAncestors(classId, parentMap);
+      mroOrder = c3Result ?? ancestors;
     } else {
-      mroOrder = gatherAncestors(classId, parentMap);
+      mroOrder = ancestors;
     }
 
     // Get the parent names for the MRO entry
@@ -349,11 +357,9 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
     // Detect collisions: methods defined in 2+ different ancestors
     const ambiguities: MethodAmbiguity[] = [];
 
-    // Compute transitive edge types once per class (only needed for implements-split languages)
+    // Use pre-computed transitive edge types (only needed for implements-split languages)
     const needsEdgeTypes = provider.mroStrategy === 'implements-split';
-    const classEdgeTypes = needsEdgeTypes
-      ? buildTransitiveEdgeTypes(classId, parentMap, parentEdgeType)
-      : undefined;
+    const classEdgeTypes = needsEdgeTypes ? edgeTypesMap.get(classId) : undefined;
 
     for (const [methodName, defs] of methodsByName) {
       if (defs.length < 2) continue;
@@ -430,6 +436,8 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
     parentMap,
     methodMap,
     parentEdgeType,
+    ancestorsMap,
+    edgeTypesMap,
   );
 
   return { entries, overrideEdges, ambiguityCount, methodImplementsEdges };
@@ -458,6 +466,12 @@ function parameterTypesMatch(
   aParamCount?: number,
   bParamCount?: number,
 ): { match: boolean; confident: boolean } {
+  // If one side is variadic and the other isn't, types may match superficially
+  // but the methods aren't guaranteed to be interchangeable
+  if ((aParamCount === undefined) !== (bParamCount === undefined)) {
+    return { match: true, confident: false };
+  }
+
   if (a.length === 0 || b.length === 0) {
     // Fall back to arity check when type info is missing
     if (aParamCount !== undefined && bParamCount !== undefined) {
@@ -489,6 +503,8 @@ function emitMethodImplementsEdges(
   parentMap: Map<string, string[]>,
   methodMap: Map<string, string[]>,
   parentEdgeType: Map<string, Map<string, 'EXTENDS' | 'IMPLEMENTS'>>,
+  ancestorsMap: Map<string, string[]>,
+  edgeTypesMap: Map<string, Map<string, 'EXTENDS' | 'IMPLEMENTS'>>,
 ): number {
   let edgeCount = 0;
 
@@ -523,9 +539,10 @@ function emitMethodImplementsEdges(
       bucket.push({ methodId, parameterTypes, parameterCount });
     }
 
-    // Collect ALL transitive ancestors and classify each as EXTENDS or IMPLEMENTS
-    const allAncestors = gatherAncestors(classId, parentMap);
-    const ancestorEdgeTypes = buildTransitiveEdgeTypes(classId, parentMap, parentEdgeType);
+    // Use pre-computed ancestors and edge types; fall back to computing if missing (safety)
+    const allAncestors = ancestorsMap.get(classId) ?? gatherAncestors(classId, parentMap);
+    const ancestorEdgeTypes =
+      edgeTypesMap.get(classId) ?? buildTransitiveEdgeTypes(classId, parentMap, parentEdgeType);
 
     // Dedup set: avoid duplicate edges from diamond paths
     const emitted = new Set<string>();

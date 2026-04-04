@@ -240,8 +240,10 @@ export const swiftProvider = defineLanguage({
   importSemantics: 'wildcard',
   heritageDefaultEdge: 'IMPLEMENTS',
   fieldExtractor: createFieldExtractor(swiftFieldConfig),
-  methodExtractor: createMethodExtractor(swiftMethodConfig),
-  extractFunctionName: swiftExtractFunctionName,
+  methodExtractor: createMethodExtractor({
+    ...swiftMethodConfig,
+    extractFunctionName: swiftExtractFunctionName,
+  }),
   implicitImportWirer: wireSwiftImplicitImports,
   builtInNames: BUILT_INS,
 });

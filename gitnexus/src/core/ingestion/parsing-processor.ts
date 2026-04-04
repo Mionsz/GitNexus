@@ -371,7 +371,10 @@ const processParsingSequential = async (
 
     // Build per-file type environment for FieldExtractor context (lightweight — skipped if no fieldExtractor)
     const typeEnv = provider.fieldExtractor
-      ? buildTypeEnv(tree, language, { enclosingFunctionFinder: provider.enclosingFunctionFinder })
+      ? buildTypeEnv(tree, language, {
+          enclosingFunctionFinder: provider.enclosingFunctionFinder,
+          extractFunctionName: provider.methodExtractor?.extractFunctionName,
+        })
       : null;
 
     matches.forEach((match) => {

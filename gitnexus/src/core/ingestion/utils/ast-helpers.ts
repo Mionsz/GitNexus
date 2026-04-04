@@ -91,18 +91,6 @@ export const FUNCTION_NODE_TYPES = new Set([
 ]);
 
 /**
- * Node types for standard function declarations that need C/C++ declarator handling.
- * Used by extractFunctionName to determine how to extract the function name.
- */
-export const FUNCTION_DECLARATION_TYPES = new Set([
-  'function_declaration',
-  'function_definition',
-  'async_function_declaration',
-  'generator_function_declaration',
-  'function_item',
-]);
-
-/**
  * AST node types that represent a class-like container (for HAS_METHOD edge extraction).
  *
  * INVARIANT: When a language config adds a new node type to `typeDeclarationNodes`,
@@ -382,93 +370,6 @@ export const findSiblingChild = (
     }
   }
   return null;
-};
-
-/**
- * Extract function name and label from a function_definition or similar AST node.
- *
- * Thin dispatcher: delegates to provider.extractFunctionName when available,
- * then falls back to generic name-field lookup for languages that don't need
- * custom AST unwrapping.
- */
-export const extractFunctionName = (
-  node: SyntaxNode,
-  provider?: {
-    extractFunctionName?: (
-      node: SyntaxNode,
-    ) => { funcName: string | null; label: NodeLabel } | null;
-  },
-): { funcName: string | null; label: NodeLabel } => {
-  // Provider hook — language-specific extraction (C/C++ declarator unwrapping,
-  // Swift init/deinit, Rust impl_item, TS arrow functions, Ruby methods)
-  if (provider?.extractFunctionName) {
-    const result = provider.extractFunctionName(node);
-    if (result) return result;
-  }
-
-  // Generic fallback: determine label from node type, then try 'name' field
-  let funcName: string | null = null;
-  let label: NodeLabel = 'Function';
-
-  if (
-    node.type === 'method_definition' ||
-    node.type === 'method_declaration' ||
-    node.type === 'method' ||
-    node.type === 'singleton_method'
-  ) {
-    label = 'Method';
-  }
-  if (node.type === 'constructor_declaration' || node.type === 'compact_constructor_declaration') {
-    label = 'Constructor';
-  }
-
-  // Dart: method_signature wraps function_signature — unwrap to reach the name
-  if (node.type === 'method_signature') {
-    label = 'Method';
-    let funcSig: SyntaxNode | null = null;
-    for (let i = 0; i < node.childCount; i++) {
-      const c = node.child(i);
-      if (c?.type === 'function_signature') {
-        funcSig = c;
-        break;
-      }
-    }
-    if (funcSig) {
-      let nameNode = funcSig.childForFieldName?.('name');
-      if (!nameNode) {
-        for (let i = 0; i < funcSig.childCount; i++) {
-          const c = funcSig.child(i);
-          if (c?.type === 'identifier') {
-            nameNode = c;
-            break;
-          }
-        }
-      }
-      funcName = nameNode?.text ?? null;
-    }
-    return { funcName, label };
-  }
-
-  // Try 'name' field first (works for most languages: Go, Python, PHP, Java, Kotlin,
-  // C#, Dart function_signature, Swift simple_identifier, generic function_declaration)
-  let nameNode = node.childForFieldName?.('name');
-  if (!nameNode) {
-    // Fallback: scan for common identifier child types
-    for (let i = 0; i < node.childCount; i++) {
-      const c = node.child(i);
-      if (
-        c?.type === 'identifier' ||
-        c?.type === 'property_identifier' ||
-        c?.type === 'simple_identifier'
-      ) {
-        nameNode = c;
-        break;
-      }
-    }
-  }
-  funcName = nameNode?.text ?? null;
-
-  return { funcName, label };
 };
 
 /** Argument list node types shared between countCallArguments and call-resolution helpers. */

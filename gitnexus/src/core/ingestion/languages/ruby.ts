@@ -108,7 +108,9 @@ export const rubyProvider = defineLanguage({
   callRouter: routeRubyCall,
   importSemantics: 'wildcard',
   fieldExtractor: createFieldExtractor(rubyFieldConfig),
-  methodExtractor: createMethodExtractor(rubyMethodConfig),
-  extractFunctionName: rubyExtractFunctionName,
+  methodExtractor: createMethodExtractor({
+    ...rubyMethodConfig,
+    extractFunctionName: rubyExtractFunctionName,
+  }),
   builtInNames: BUILT_INS,
 });

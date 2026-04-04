@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
 import { getProvider } from '../../src/core/ingestion/languages/index.js';
-import { extractFunctionName } from '../../src/core/ingestion/utils/ast-helpers.js';
+import type { SyntaxNode } from '../../src/core/ingestion/utils/ast-helpers.js';
+import type { NodeLabel } from 'gitnexus-shared';
+import type { LanguageProvider } from '../../src/core/ingestion/language-provider.js';
 import {
   getTreeSitterBufferSize,
   TREE_SITTER_BUFFER_SIZE,
@@ -341,11 +343,23 @@ describe('isBuiltInOrNoise', () => {
   });
 });
 
-describe('extractFunctionName', () => {
+describe('extractFunctionName (via methodExtractor)', () => {
   const parser = new Parser();
   const cProvider = getProvider(SupportedLanguages.C);
   const cppProvider = getProvider(SupportedLanguages.CPlusPlus);
   const tsProvider = getProvider(SupportedLanguages.TypeScript);
+
+  /** Test helper: extracts function name using methodExtractor hook with generic fallback. */
+  const extractFunctionName = (
+    node: SyntaxNode | null,
+    provider?: LanguageProvider,
+  ): { funcName: string | null; label: NodeLabel } => {
+    if (!node) return { funcName: null, label: 'Function' };
+    const result = provider?.methodExtractor?.extractFunctionName?.(node);
+    if (result) return result;
+    const funcName = node.childForFieldName?.('name')?.text ?? null;
+    return { funcName, label: 'Function' };
+  };
 
   describe('C', () => {
     it('extracts function name from C function definition', () => {

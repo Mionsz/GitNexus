@@ -41,7 +41,6 @@ try {
 import { getLanguageFromFilename } from 'gitnexus-shared';
 import {
   FUNCTION_NODE_TYPES,
-  extractFunctionName,
   getDefinitionNodeFromCaptures,
   findEnclosingClassInfo,
   type EnclosingClassInfo,
@@ -512,6 +511,40 @@ function getMethodInfo(
 
 import type { LanguageProvider } from '../language-provider.js';
 
+/** Generic name extraction from a function-like AST node. */
+const genericFuncName = (node: SyntaxNode): string | null => {
+  const nameField = node.childForFieldName?.('name');
+  if (nameField) return nameField.text;
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i);
+    if (
+      c?.type === 'identifier' ||
+      c?.type === 'property_identifier' ||
+      c?.type === 'simple_identifier'
+    )
+      return c.text;
+  }
+  return null;
+};
+
+/** Infer node label from AST node type for function-like nodes without a provider hook. */
+const METHOD_NODE_TYPES = new Set([
+  'method_definition',
+  'method_declaration',
+  'method',
+  'singleton_method',
+]);
+const CONSTRUCTOR_NODE_TYPES = new Set([
+  'constructor_declaration',
+  'compact_constructor_declaration',
+]);
+const inferFunctionLabel = (nodeType: string): import('gitnexus-shared').NodeLabel =>
+  METHOD_NODE_TYPES.has(nodeType)
+    ? 'Method'
+    : CONSTRUCTOR_NODE_TYPES.has(nodeType)
+      ? 'Constructor'
+      : 'Function';
+
 /** Walk up AST to find enclosing function, return its generateId or null for top-level.
  *  Applies provider.labelOverride so the label matches the definition phase (single source of truth). */
 const findEnclosingFunctionId = (
@@ -525,7 +558,9 @@ const findEnclosingFunctionId = (
   let current = node.parent;
   while (current) {
     if (FUNCTION_NODE_TYPES.has(current.type)) {
-      const { funcName, label } = extractFunctionName(current, provider);
+      const efnResult = provider.methodExtractor?.extractFunctionName?.(current);
+      const funcName = efnResult?.funcName ?? genericFuncName(current);
+      const label = efnResult?.label ?? inferFunctionLabel(current.type);
       if (funcName) {
         // Apply labelOverride so label matches definition phase (e.g., Kotlin Function→Method).
         // null means "skip as definition" — keep original label for scope identification.
@@ -1353,6 +1388,7 @@ const processFileGroup = (
     const typeEnv = buildTypeEnv(tree, language, {
       parentMap,
       enclosingFunctionFinder: provider?.enclosingFunctionFinder,
+      extractFunctionName: provider?.methodExtractor?.extractFunctionName,
     });
     const callRouter = provider.callRouter;
 

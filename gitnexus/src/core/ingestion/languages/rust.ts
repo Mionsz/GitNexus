@@ -120,7 +120,9 @@ export const rustProvider = defineLanguage({
   namedBindingExtractor: extractRustNamedBindings,
   mroStrategy: 'qualified-syntax',
   fieldExtractor: createFieldExtractor(rustFieldConfig),
-  methodExtractor: createMethodExtractor(rustMethodConfig),
-  extractFunctionName: rustExtractFunctionName,
+  methodExtractor: createMethodExtractor({
+    ...rustMethodConfig,
+    extractFunctionName: rustExtractFunctionName,
+  }),
   builtInNames: BUILT_INS,
 });

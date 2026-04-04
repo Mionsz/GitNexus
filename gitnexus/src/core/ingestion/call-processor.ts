@@ -12,7 +12,6 @@ import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
 import {
   FUNCTION_NODE_TYPES,
-  extractFunctionName,
   findEnclosingClassId,
   findEnclosingClassInfo,
 } from './utils/ast-helpers.js';
@@ -220,6 +219,40 @@ const TYPE_PRESERVING_METHODS = new Set([
   'orElseThrow', // Java Optional
 ]);
 
+/** Generic name extraction from a function-like AST node. */
+const genericFuncName = (node: SyntaxNode): string | null => {
+  const nameField = node.childForFieldName?.('name');
+  if (nameField) return nameField.text;
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i);
+    if (
+      c?.type === 'identifier' ||
+      c?.type === 'property_identifier' ||
+      c?.type === 'simple_identifier'
+    )
+      return c.text;
+  }
+  return null;
+};
+
+/** Infer node label from AST node type for function-like nodes without a provider hook. */
+const METHOD_NODE_TYPES = new Set([
+  'method_definition',
+  'method_declaration',
+  'method',
+  'singleton_method',
+]);
+const CONSTRUCTOR_NODE_TYPES = new Set([
+  'constructor_declaration',
+  'compact_constructor_declaration',
+]);
+const inferFunctionLabel = (nodeType: string): import('gitnexus-shared').NodeLabel =>
+  METHOD_NODE_TYPES.has(nodeType)
+    ? 'Method'
+    : CONSTRUCTOR_NODE_TYPES.has(nodeType)
+      ? 'Constructor'
+      : 'Function';
+
 /**
  * Walk up the AST from a node to find the enclosing function/method.
  * Returns null if the call is at module/file level (top-level code).
@@ -234,7 +267,9 @@ const findEnclosingFunction = (
 
   while (current) {
     if (FUNCTION_NODE_TYPES.has(current.type)) {
-      const { funcName, label } = extractFunctionName(current, provider);
+      const efnResult = provider.methodExtractor?.extractFunctionName?.(current);
+      const funcName = efnResult?.funcName ?? genericFuncName(current);
+      const label = efnResult?.label ?? inferFunctionLabel(current.type);
 
       if (funcName) {
         const resolved = ctx.resolve(funcName, filePath);
@@ -626,6 +661,7 @@ export const processCalls = async (
       importedReturnTypes,
       importedRawReturnTypes,
       enclosingFunctionFinder: provider?.enclosingFunctionFinder,
+      extractFunctionName: provider?.methodExtractor?.extractFunctionName,
     });
     if (typeEnv && exportedTypeMap) {
       const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
@@ -866,7 +902,8 @@ export const processCalls = async (
         let p = callNode.parent;
         while (p) {
           if (FUNCTION_NODE_TYPES.has(p.type)) {
-            const { funcName } = extractFunctionName(p, provider);
+            const funcName =
+              provider.methodExtractor?.extractFunctionName?.(p)?.funcName ?? genericFuncName(p);
             if (funcName) {
               scope = `${funcName}@${p.startIndex}`;
               break;

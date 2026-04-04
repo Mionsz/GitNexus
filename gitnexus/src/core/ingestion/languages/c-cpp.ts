@@ -15,7 +15,19 @@ import { cCppExportChecker } from '../export-detection.js';
 import { resolveCImport, resolveCppImport } from '../import-resolvers/standard.js';
 import { C_QUERIES, CPP_QUERIES } from '../tree-sitter-queries.js';
 
-import { isCppInsideClassOrStruct, FUNCTION_DECLARATION_TYPES } from '../utils/ast-helpers.js';
+import { isCppInsideClassOrStruct } from '../utils/ast-helpers.js';
+
+/**
+ * Node types for standard function declarations that need C/C++ declarator handling.
+ * Used by cCppExtractFunctionName to determine how to extract the function name.
+ */
+const FUNCTION_DECLARATION_TYPES = new Set([
+  'function_declaration',
+  'function_definition',
+  'async_function_declaration',
+  'generator_function_declaration',
+  'function_item',
+]);
 import type { SyntaxNode } from '../utils/ast-helpers.js';
 import type { NodeLabel } from 'gitnexus-shared';
 import type { LanguageProvider } from '../language-provider.js';
@@ -289,8 +301,10 @@ export const cProvider = defineLanguage({
   importResolver: resolveCImport,
   importSemantics: 'wildcard',
   fieldExtractor: createFieldExtractor(cFieldConfig),
-  methodExtractor: createMethodExtractor(cMethodConfig),
-  extractFunctionName: cCppExtractFunctionName,
+  methodExtractor: createMethodExtractor({
+    ...cMethodConfig,
+    extractFunctionName: cCppExtractFunctionName,
+  }),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
 });
@@ -305,8 +319,10 @@ export const cppProvider = defineLanguage({
   importSemantics: 'wildcard',
   mroStrategy: 'leftmost-base',
   fieldExtractor: createFieldExtractor(cppFieldConfig),
-  methodExtractor: createMethodExtractor(cppMethodConfig),
-  extractFunctionName: cCppExtractFunctionName,
+  methodExtractor: createMethodExtractor({
+    ...cppMethodConfig,
+    extractFunctionName: cCppExtractFunctionName,
+  }),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
 });

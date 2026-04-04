@@ -156,8 +156,10 @@ export const typescriptProvider = defineLanguage({
   importResolver: resolveTypescriptImport,
   namedBindingExtractor: extractTsNamedBindings,
   fieldExtractor: typescriptFieldExtractor,
-  methodExtractor: createMethodExtractor(typescriptMethodConfig),
-  extractFunctionName: tsExtractFunctionName,
+  methodExtractor: createMethodExtractor({
+    ...typescriptMethodConfig,
+    extractFunctionName: tsExtractFunctionName,
+  }),
   builtInNames: BUILT_INS,
 });
 
@@ -170,7 +172,9 @@ export const javascriptProvider = defineLanguage({
   importResolver: resolveJavascriptImport,
   namedBindingExtractor: extractTsNamedBindings,
   fieldExtractor: createFieldExtractor(javascriptConfig),
-  methodExtractor: createMethodExtractor(javascriptMethodConfig),
-  extractFunctionName: tsExtractFunctionName,
+  methodExtractor: createMethodExtractor({
+    ...javascriptMethodConfig,
+    extractFunctionName: tsExtractFunctionName,
+  }),
   builtInNames: BUILT_INS,
 });

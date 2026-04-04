@@ -886,7 +886,7 @@ describe('TypeScript return type inference via explicit function return type', (
   });
 
   it('resolves user.save() to User#save via return type of getUser(): User', () => {
-    // TS has explicit return types in the source, so extractMethodSignature captures
+    // TS has explicit return types in the source, so the method extractor captures
     // the return type. The TS extractInitializer handles `const user = getUser()`
     // via the variable_declarator path, enabling save() to resolve to User#save.
     const calls = getRelationships(result, 'CALLS');

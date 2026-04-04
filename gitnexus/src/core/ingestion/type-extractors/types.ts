@@ -171,7 +171,7 @@ export interface LanguageTypeConfig {
    *  The callee binding is unverified — the caller must confirm against the SymbolTable. */
   scanConstructorBinding?: ConstructorBindingScanner;
   /** Extract return type from comment-based annotations (e.g. YARD @return [Type]).
-   *  Called as fallback when extractMethodSignature finds no AST-based return type. */
+   *  Called as fallback when the MethodExtractor finds no AST-based return type. */
   extractReturnType?: ReturnTypeExtractor;
   /** Extract loop variable → type binding from a for-each AST node. */
   extractForLoopBinding?: ForLoopExtractor;

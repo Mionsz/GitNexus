@@ -13,7 +13,7 @@ import { yieldToEventLoop } from './utils/event-loop.js';
 import {
   FUNCTION_NODE_TYPES,
   extractFunctionName,
-  extractMethodSignature,
+  countMethodParameters,
   findEnclosingClassId,
   findEnclosingClassInfo,
 } from './utils/ast-helpers.js';
@@ -267,7 +267,7 @@ const findEnclosingFunction = (
         const qualifiedName = classInfo ? `${classInfo.className}.${funcName}` : funcName;
         // Include #<arity> suffix to match definition-phase Method/Constructor IDs
         const needsArity = finalLabel === 'Method' || finalLabel === 'Constructor';
-        const arity = needsArity ? extractMethodSignature(current).parameterCount : undefined;
+        const arity = needsArity ? countMethodParameters(current) : undefined;
         const arityTag = arity !== undefined ? `#${arity}` : '';
         return generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag}`);
       }
@@ -307,7 +307,7 @@ const findEnclosingFunction = (
         // Include #<arity> suffix to match definition-phase Method/Constructor IDs
         const sigNode = current.previousSibling ?? current;
         const needsArity2 = finalLabel === 'Method' || finalLabel === 'Constructor';
-        const arity2 = needsArity2 ? extractMethodSignature(sigNode).parameterCount : undefined;
+        const arity2 = needsArity2 ? countMethodParameters(sigNode) : undefined;
         const arityTag2 = arity2 !== undefined ? `#${arity2}` : '';
         return generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag2}`);
       }

@@ -12,7 +12,6 @@ import { yieldToEventLoop } from './utils/event-loop.js';
 import {
   getDefinitionNodeFromCaptures,
   findEnclosingClassInfo,
-  extractMethodSignature,
   getLabelFromCaptures,
   CLASS_CONTAINER_TYPES,
   type SyntaxNode,
@@ -417,9 +416,8 @@ const processParsingSequential = async (
 
       // Extract method metadata for Function/Method/Constructor nodes BEFORE generating
       // the node ID — parameterCount is needed to disambiguate overloaded methods.
-      // Try the per-language methodExtractor first (provides isAbstract, isStatic,
-      // visibility, annotations, etc.). Fall back to extractMethodSignature for
-      // basic parameterCount/parameterTypes/returnType when no methodExtractor exists.
+      // Use the per-language MethodExtractor for method metadata (isAbstract, isStatic,
+      // visibility, annotations, parameterCount, parameterTypes, returnType, etc.).
       const isMethodLike =
         nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor';
       let methodProps: Record<string, unknown> = {};
@@ -471,31 +469,6 @@ const processParsingSequential = async (
                 : info.parameters.length;
               methodProps = buildMethodProps(info);
             }
-          }
-        }
-
-        // Fallback to generic extractMethodSignature
-        if (!enriched) {
-          const sig = extractMethodSignature(definitionNode);
-          arityForId = sig.parameterCount;
-          methodProps = {
-            parameterCount: sig.parameterCount,
-            ...(sig.requiredParameterCount !== undefined
-              ? { requiredParameterCount: sig.requiredParameterCount }
-              : {}),
-            ...(sig.parameterTypes ? { parameterTypes: sig.parameterTypes } : {}),
-            returnType: sig.returnType,
-          };
-        }
-
-        // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
-        // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
-        const rt = methodProps.returnType as string | undefined;
-        if (!rt || rt === 'array' || rt === 'iterable') {
-          const tc = provider.typeConfig;
-          if (tc?.extractReturnType) {
-            const docReturn = tc.extractReturnType(definitionNode);
-            if (docReturn) methodProps.returnType = docReturn;
           }
         }
       }

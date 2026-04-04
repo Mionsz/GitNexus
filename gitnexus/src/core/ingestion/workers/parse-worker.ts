@@ -46,7 +46,7 @@ import {
   findEnclosingClassInfo,
   type EnclosingClassInfo,
   getLabelFromCaptures,
-  extractMethodSignature,
+  countMethodParameters,
   findDescendant,
   extractStringContent,
   type SyntaxNode,
@@ -540,7 +540,7 @@ const findEnclosingFunctionId = (
         const qualifiedName = classInfo ? `${classInfo.className}.${funcName}` : funcName;
         // Include #<arity> suffix to match definition-phase Method/Constructor IDs
         const needsArity = finalLabel === 'Method' || finalLabel === 'Constructor';
-        const arity = needsArity ? extractMethodSignature(current).parameterCount : undefined;
+        const arity = needsArity ? countMethodParameters(current) : undefined;
         const arityTag = arity !== undefined ? `#${arity}` : '';
         const result = generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag}`);
         functionIdCache.set(node, result);
@@ -569,7 +569,7 @@ const findEnclosingFunctionId = (
         // Include #<arity> suffix to match definition-phase Method/Constructor IDs
         const sigNode = current.previousSibling ?? current;
         const needsArity2 = finalLabel === 'Method' || finalLabel === 'Constructor';
-        const arity2 = needsArity2 ? extractMethodSignature(sigNode).parameterCount : undefined;
+        const arity2 = needsArity2 ? countMethodParameters(sigNode) : undefined;
         const arityTag2 = arity2 !== undefined ? `#${arity2}` : '';
         const result = generateId(finalLabel, `${filePath}:${qualifiedName}${arityTag2}`);
         functionIdCache.set(node, result);
@@ -1804,9 +1804,8 @@ const processFileGroup = (
       let annotations: string[] | undefined;
       let arityForId: number | undefined; // raw param count for ID, even for variadic
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
-        // Try MethodExtractor first — it provides everything extractMethodSignature does, plus
-        // isAbstract/isFinal/annotations. Only fall back to extractMethodSignature when no
-        // MethodExtractor is available or the method isn't inside a class body.
+        // Use MethodExtractor for method metadata — provides parameterCount, parameterTypes,
+        // returnType, isAbstract/isFinal/annotations, visibility, and more.
         let enrichedByMethodExtractor = false;
         if (provider.methodExtractor && definitionNode) {
           const classNode =
@@ -1884,28 +1883,6 @@ const processFileGroup = (
             if (info.isAsync) isAsync = info.isAsync;
             if (info.isPartial) isPartial = info.isPartial;
             if (info.annotations.length > 0) annotations = info.annotations;
-          }
-        }
-
-        if (!enrichedByMethodExtractor) {
-          const sig = extractMethodSignature(definitionNode);
-          arityForId = sig.parameterCount;
-          parameterCount = sig.parameterCount;
-          requiredParameterCount = sig.requiredParameterCount;
-          parameterTypes = sig.parameterTypes;
-          returnType = sig.returnType;
-        }
-
-        // Language-specific return type fallback (e.g. Ruby YARD @return [Type])
-        // Also upgrades uninformative AST types like PHP `array` with PHPDoc `@return User[]`
-        if (
-          (!returnType || returnType === 'array' || returnType === 'iterable') &&
-          definitionNode
-        ) {
-          const tc = provider.typeConfig;
-          if (tc?.extractReturnType) {
-            const docReturn = tc.extractReturnType(definitionNode);
-            if (docReturn) returnType = docReturn;
           }
         }
       }

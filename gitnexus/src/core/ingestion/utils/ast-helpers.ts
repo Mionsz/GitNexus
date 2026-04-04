@@ -2,7 +2,6 @@ import type Parser from 'tree-sitter';
 import type { NodeLabel } from 'gitnexus-shared';
 import type { LanguageProvider } from '../language-provider.js';
 import { generateId } from '../../../lib/utils.js';
-import { extractSimpleTypeName } from '../type-extractors/shared.js';
 
 /** Tree-sitter AST node. Re-exported for use across ingestion modules. */
 export type SyntaxNode = Parser.SyntaxNode;
@@ -642,102 +641,56 @@ export const extractFunctionName = (
   return { funcName, label };
 };
 
-export interface MethodSignature {
-  parameterCount: number | undefined;
-  /** Number of required (non-optional, non-default) parameters.
-   *  Only set when fewer than parameterCount — enables range-based arity filtering.
-   *  undefined means all parameters are required (or metadata unavailable). */
-  requiredParameterCount: number | undefined;
-  /** Per-parameter type names extracted via extractSimpleTypeName.
-   *  Only populated for languages with method overloading (Java, Kotlin, C#, C++).
-   *  undefined (not []) when no types are extractable — avoids empty array allocations. */
-  parameterTypes: string[] | undefined;
-  returnType: string | undefined;
-}
-
-/** Argument list node types shared between extractMethodSignature and countCallArguments. */
+/** Argument list node types shared between countCallArguments and call-resolution helpers. */
 export const CALL_ARGUMENT_LIST_TYPES = new Set(['arguments', 'argument_list', 'value_arguments']);
 
+/** Parameter list node types used for arity counting. */
+const PARAM_LIST_TYPES = new Set([
+  'formal_parameters',
+  'parameters',
+  'parameter_list',
+  'function_parameters',
+  'method_parameters',
+  'function_value_parameters',
+  'formal_parameter_list', // Dart
+]);
+
+/** Node types that indicate variadic/rest parameters. */
+const VARIADIC_PARAM_TYPES = new Set([
+  'variadic_parameter_declaration', // Go
+  'variadic_parameter', // Rust
+  'spread_parameter', // Java
+  'list_splat_pattern', // Python
+  'dictionary_splat_pattern', // Python
+]);
+
 /**
- * Extract parameter count and return type text from an AST method/function node.
- * Works across languages by looking for common AST patterns.
+ * Count the number of parameters on a method/function AST node.
+ * Returns undefined for variadic signatures (same convention as MethodExtractor).
+ * Used by call-resolution to compute arity suffixes for overload disambiguation.
  */
-export const extractMethodSignature = (node: SyntaxNode | null | undefined): MethodSignature => {
-  let parameterCount: number | undefined = 0;
-  let requiredCount = 0;
-  let returnType: string | undefined;
-  let isVariadic = false;
-  const paramTypes: string[] = [];
+export const countMethodParameters = (node: SyntaxNode | null | undefined): number | undefined => {
+  if (!node) return 0;
 
-  if (!node)
-    return {
-      parameterCount,
-      requiredParameterCount: undefined,
-      parameterTypes: undefined,
-      returnType,
-    };
-
-  const paramListTypes = new Set([
-    'formal_parameters',
-    'parameters',
-    'parameter_list',
-    'function_parameters',
-    'method_parameters',
-    'function_value_parameters',
-    'formal_parameter_list', // Dart
-  ]);
-
-  // Node types that indicate variadic/rest parameters
-  const VARIADIC_PARAM_TYPES = new Set([
-    'variadic_parameter_declaration', // Go: ...string
-    'variadic_parameter', // Rust: extern "C" fn(...)
-    'spread_parameter', // Java: Object... args
-    'list_splat_pattern', // Python: *args
-    'dictionary_splat_pattern', // Python: **kwargs
-  ]);
-
-  /** AST node types that represent parameters with default values. */
-  const OPTIONAL_PARAM_TYPES = new Set([
-    'optional_parameter', // TypeScript, Ruby: (x?: number), (x: number = 5), def f(x = 5)
-    'default_parameter', // Python: def f(x=5)
-    'typed_default_parameter', // Python: def f(x: int = 5)
-    'optional_parameter_declaration', // C++: void f(int x = 5)
-  ]);
-
-  /** Check if a parameter node has a default value (handles Kotlin, C#, Swift, PHP
-   *  where defaults are expressed as child nodes rather than distinct node types). */
-  const hasDefaultValue = (paramNode: SyntaxNode): boolean => {
-    if (OPTIONAL_PARAM_TYPES.has(paramNode.type)) return true;
-    // C#, Swift, PHP: check for '=' token or equals_value_clause child
-    for (let i = 0; i < paramNode.childCount; i++) {
-      const c = paramNode.child(i);
-      if (!c) continue;
-      if (c.type === '=' || c.type === 'equals_value_clause') return true;
-    }
-    // Kotlin: default values are siblings of the parameter node, not children.
-    // The AST is: parameter, =, <literal>  — all at function_value_parameters level.
-    // Check if the immediately following sibling is '=' (default value separator).
-    const sib = paramNode.nextSibling;
-    if (sib && sib.type === '=') return true;
-    return false;
-  };
-
-  const findParameterList = (current: SyntaxNode): SyntaxNode | null => {
+  const findParamList = (current: SyntaxNode): SyntaxNode | null => {
     for (const child of current.children) {
-      if (paramListTypes.has(child.type)) return child;
+      if (PARAM_LIST_TYPES.has(child.type)) return child;
     }
     for (const child of current.children) {
-      const nested = findParameterList(child);
+      const nested = findParamList(child);
       if (nested) return nested;
     }
     return null;
   };
 
-  const parameterList = paramListTypes.has(node.type)
-    ? node // node itself IS the parameter list (e.g. C# primary constructors)
-    : (node.childForFieldName?.('parameters') ?? findParameterList(node));
+  const parameterList = PARAM_LIST_TYPES.has(node.type)
+    ? node
+    : (node.childForFieldName?.('parameters') ?? findParamList(node));
 
-  if (parameterList && paramListTypes.has(parameterList.type)) {
+  let count = 0;
+  let isVariadic = false;
+
+  if (parameterList && PARAM_LIST_TYPES.has(parameterList.type)) {
     for (const param of parameterList.namedChildren) {
       if (param.type === 'comment') continue;
       if (
@@ -745,34 +698,27 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
         param.text === '&self' ||
         param.text === '&mut self' ||
         param.type === 'self_parameter'
-      ) {
+      )
         continue;
-      }
-      // TypeScript: `this` parameter is a compile-time type constraint, not a real param
-      // e.g., handle(this: void, event: Event) — only count 'event'
+      // TypeScript: `this` parameter is a type constraint, not a real param
       if (param.type === 'required_parameter') {
         const patternNode = param.childForFieldName('pattern');
         if (patternNode?.type === 'this') continue;
       }
-      // Kotlin: default values are siblings of the parameter node inside
-      // function_value_parameters, so they appear as named children (e.g.
-      // string_literal, integer_literal, boolean_literal, call_expression).
-      // Skip any named child that isn't a parameter-like or modifier node.
+      // Skip Kotlin default-value siblings that appear as named children
       if (
         param.type.endsWith('_literal') ||
         param.type === 'call_expression' ||
         param.type === 'navigation_expression' ||
         param.type === 'prefix_expression' ||
         param.type === 'parenthesized_expression'
-      ) {
+      )
         continue;
-      }
-      // Check for variadic parameter types
       if (VARIADIC_PARAM_TYPES.has(param.type)) {
         isVariadic = true;
         continue;
       }
-      // TypeScript/JavaScript: rest parameter — required_parameter containing rest_pattern
+      // TS/JS rest parameter
       if (param.type === 'required_parameter' || param.type === 'optional_parameter') {
         for (const child of param.children) {
           if (child.type === 'rest_pattern') {
@@ -782,45 +728,16 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
         }
         if (isVariadic) continue;
       }
-      // Kotlin: vararg modifier on a regular parameter
+      // Kotlin vararg
       if (param.type === 'parameter' || param.type === 'formal_parameter') {
         const prev = param.previousSibling;
         if (prev?.type === 'parameter_modifiers' && prev.text.includes('vararg')) {
           isVariadic = true;
         }
       }
-      // Extract parameter type name for overload disambiguation.
-      // Works for Java (formal_parameter), Kotlin (parameter), C# (parameter),
-      // C++ (parameter_declaration). Uses childForFieldName('type') which is the
-      // standard tree-sitter field for typed parameters across these languages.
-      // Kotlin uses positional children instead of 'type' field — fall back to
-      // searching for user_type/nullable_type/predefined_type children.
-      const paramTypeNode = param.childForFieldName('type');
-      if (paramTypeNode) {
-        const typeName = extractSimpleTypeName(paramTypeNode);
-        paramTypes.push(typeName ?? 'unknown');
-      } else {
-        // Kotlin: parameter → [simple_identifier, user_type|nullable_type]
-        let found = false;
-        for (const child of param.namedChildren) {
-          if (
-            child.type === 'user_type' ||
-            child.type === 'nullable_type' ||
-            child.type === 'type_identifier' ||
-            child.type === 'predefined_type'
-          ) {
-            const typeName = extractSimpleTypeName(child);
-            paramTypes.push(typeName ?? 'unknown');
-            found = true;
-            break;
-          }
-        }
-        if (!found) paramTypes.push('unknown');
-      }
-      if (!hasDefaultValue(param)) requiredCount++;
-      parameterCount++;
+      count++;
     }
-    // C/C++: bare `...` token in parameter list (not a named child — check all children)
+    // C/C++: bare `...` token
     if (!isVariadic) {
       for (const child of parameterList.children) {
         if (!child.isNamed && child.text === '...') {
@@ -831,105 +748,14 @@ export const extractMethodSignature = (node: SyntaxNode | null | undefined): Met
     }
   }
 
-  // Swift fallback: tree-sitter-swift places `parameter` nodes as direct children of
-  // function_declaration without a wrapping parameters/function_parameters list node.
-  // When no parameter list was found, count direct `parameter` children on the node.
-  if (!parameterList && parameterCount === 0) {
+  // Swift fallback: parameter nodes as direct children of function_declaration
+  if (!parameterList && count === 0) {
     for (const child of node.namedChildren) {
-      if (child.type === 'parameter') {
-        if (!hasDefaultValue(child)) requiredCount++;
-        parameterCount++;
-      }
+      if (child.type === 'parameter') count++;
     }
   }
 
-  // Return type extraction — language-specific field names
-  // Go: 'result' field is either a type_identifier or parameter_list (multi-return)
-  const goResult = node.childForFieldName?.('result');
-  if (goResult) {
-    if (goResult.type === 'parameter_list') {
-      // Multi-return: extract first parameter's type only (e.g. (*User, error) → *User)
-      const firstParam = goResult.firstNamedChild;
-      if (firstParam?.type === 'parameter_declaration') {
-        const typeNode = firstParam.childForFieldName('type');
-        if (typeNode) returnType = typeNode.text;
-      } else if (firstParam) {
-        // Unnamed return types: (string, error) — first child is a bare type node
-        returnType = firstParam.text;
-      }
-    } else {
-      returnType = goResult.text;
-    }
-  }
-
-  // Rust: 'return_type' field — the value IS the type node (e.g. primitive_type, type_identifier).
-  // Skip if the node is a type_annotation (TS/Python), which is handled by the generic loop below.
-  if (!returnType) {
-    const rustReturn = node.childForFieldName?.('return_type');
-    if (rustReturn && rustReturn.type !== 'type_annotation') {
-      returnType = rustReturn.text;
-    }
-  }
-
-  // C/C++: 'type' field on function_definition
-  if (!returnType) {
-    const cppType = node.childForFieldName?.('type');
-    if (cppType && cppType.text !== 'void') {
-      returnType = cppType.text;
-    }
-  }
-
-  // C#: 'returns' field on method_declaration
-  if (!returnType) {
-    const csReturn = node.childForFieldName?.('returns');
-    if (csReturn && csReturn.text !== 'void') {
-      returnType = csReturn.text;
-    }
-  }
-
-  // TS/Rust/Python/C#/Kotlin: type_annotation or return_type child
-  if (!returnType) {
-    for (const child of node.children) {
-      if (child.type === 'type_annotation' || child.type === 'return_type') {
-        const typeNode = child.children.find((c) => c.isNamed);
-        if (typeNode) returnType = typeNode.text;
-      }
-    }
-  }
-
-  // Kotlin: fun getUser(): User — return type is a bare user_type child of
-  // function_declaration. The Kotlin grammar does NOT wrap it in type_annotation
-  // or return_type; it appears as a direct child after function_value_parameters.
-  // Note: Kotlin uses function_value_parameters (not a field), so we find it by type.
-  if (!returnType) {
-    let paramsEnd = -1;
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
-      if (!child) continue;
-      if (child.type === 'function_value_parameters' || child.type === 'value_parameters') {
-        paramsEnd = child.endIndex;
-      }
-      if (paramsEnd >= 0 && child.type === 'user_type' && child.startIndex > paramsEnd) {
-        returnType = child.text;
-        break;
-      }
-    }
-  }
-
-  if (isVariadic) parameterCount = undefined;
-
-  // Only include parameterTypes when at least one type was successfully extracted.
-  // Use undefined (not []) to avoid empty array allocations for untyped parameters.
-  const hasTypes = paramTypes.length > 0 && paramTypes.some((t) => t !== 'unknown');
-  // Only set requiredParameterCount when it differs from total — saves memory on the common case.
-  const requiredParameterCount =
-    !isVariadic && requiredCount < (parameterCount ?? 0) ? requiredCount : undefined;
-  return {
-    parameterCount,
-    requiredParameterCount,
-    parameterTypes: hasTypes ? paramTypes : undefined,
-    returnType,
-  };
+  return isVariadic ? undefined : count;
 };
 
 // ============================================================================

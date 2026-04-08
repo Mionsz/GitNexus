@@ -242,6 +242,14 @@ export interface FileTypeEnvBindings {
   bindings: [string, string][];
 }
 
+/** All-scope type bindings from TypeEnv — includes function-local scopes.
+ *  Used by BindingAccumulator for cross-file type propagation (Phase 9+). */
+export interface FileAllScopeBindings {
+  filePath: string;
+  /** [scope, varName, typeName] triples from all scopes. */
+  bindings: [string, string, string][];
+}
+
 export interface ParseWorkerResult {
   nodes: ParsedNode[];
   relationships: ParsedRelationship[];
@@ -258,6 +266,8 @@ export interface ParseWorkerResult {
   constructorBindings: FileConstructorBindings[];
   /** File-scope type bindings from TypeEnv fixpoint for exported symbol collection. */
   typeEnvBindings: FileTypeEnvBindings[];
+  /** All-scope type bindings from TypeEnv for BindingAccumulator (includes function-local). */
+  allScopeBindings: FileAllScopeBindings[];
   skippedLanguages: Record<string, number>;
   fileCount: number;
 }
@@ -691,6 +701,7 @@ const processBatch = (
     ormQueries: [],
     constructorBindings: [],
     typeEnvBindings: [],
+    allScopeBindings: [],
     skippedLanguages: {},
     fileCount: 0,
   };
@@ -1394,6 +1405,20 @@ const processFileGroup = (
       const bindings: [string, string][] = [];
       for (const [name, type] of fileScope) bindings.push([name, type]);
       result.typeEnvBindings.push({ filePath: file.path, bindings });
+    }
+
+    // Serialize all scopes for BindingAccumulator (Phase 9+ cross-file propagation)
+    const allScopes = typeEnv.allScopes();
+    if (allScopes.size > 0) {
+      const scopeBindings: [string, string, string][] = [];
+      for (const [scope, scopeMap] of allScopes) {
+        for (const [varName, typeName] of scopeMap) {
+          scopeBindings.push([scope, varName, typeName]);
+        }
+      }
+      if (scopeBindings.length > 0) {
+        result.allScopeBindings.push({ filePath: file.path, bindings: scopeBindings });
+      }
     }
 
     // Per-file map: decorator end-line → decorator info, for associating with definitions
@@ -2114,6 +2139,7 @@ let accumulated: ParseWorkerResult = {
   ormQueries: [],
   constructorBindings: [],
   typeEnvBindings: [],
+  allScopeBindings: [],
   skippedLanguages: {},
   fileCount: 0,
 };
@@ -2134,6 +2160,7 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.ormQueries.push(...src.ormQueries);
   target.constructorBindings.push(...src.constructorBindings);
   target.typeEnvBindings.push(...src.typeEnvBindings);
+  target.allScopeBindings.push(...src.allScopeBindings);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
@@ -2185,6 +2212,7 @@ parentPort!.on('message', (msg: WorkerIncomingMessage) => {
         ormQueries: [],
         constructorBindings: [],
         typeEnvBindings: [],
+        allScopeBindings: [],
         skippedLanguages: {},
         fileCount: 0,
       };

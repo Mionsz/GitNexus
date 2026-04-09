@@ -918,11 +918,16 @@ async function runChunkedParseAndResolve(
             });
           }),
         ]);
-        // Collect all-scope bindings into BindingAccumulator
+        // Collect file-scope bindings into BindingAccumulator.
+        // PR #743 review: the worker IPC payload now carries only file-scope
+        // entries (`scope = ''` hardcoded here). See the FileAllScopeBindings
+        // JSDoc in parse-worker.ts for the rationale and Phase 9 reversion
+        // path — the field name is retained to keep that future revert
+        // mechanically trivial.
         if (chunkWorkerData.allScopeBindings?.length) {
           for (const { filePath, bindings } of chunkWorkerData.allScopeBindings) {
-            const entries = bindings.map(([scope, varName, typeName]) => ({
-              scope,
+            const entries = bindings.map(([varName, typeName]) => ({
+              scope: '',
               varName,
               typeName,
             }));

@@ -798,8 +798,19 @@ describe('SymbolTable', () => {
       expect(table.lookupClassByName('Qux')).toEqual([]);
     });
 
+    it('includes Trait in the class set (PHP use, Rust impl, Scala traits)', () => {
+      // Traits are class-like for heritage resolution — they contribute
+      // methods to the using/implementing type's hierarchy. buildHeritageMap
+      // relies on this to resolve `use Trait;` edges in PHP, `impl Trait for
+      // Struct` in Rust, etc. Added as part of PR #744 (SM-11 Codex review
+      // fixes) after the PHP HasTimestamps trait walk gap was discovered.
+      table.add('src/a.rs', 'Writer', 'trait:Writer', 'Trait');
+      const results = table.lookupClassByName('Writer');
+      expect(results).toHaveLength(1);
+      expect(results[0].nodeId).toBe('trait:Writer');
+    });
+
     it('does NOT include other type-like labels outside the allowed class set', () => {
-      table.add('src/a.rs', 'User', 'trait:User', 'Trait');
       table.add('src/a.ts', 'User', 'type:User', 'Type');
       expect(table.lookupClassByName('User')).toEqual([]);
     });
@@ -1396,5 +1407,1366 @@ describe('lookupMethodByOwnerWithMRO', () => {
     );
     expect(result).toBeDefined();
     expect(result!.nodeId).toBe('method:User:getName');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveMemberCall — SM-11: owner-scoped + MRO member-call resolution
+// ---------------------------------------------------------------------------
+
+import {
+  _resolveCallTargetForTesting,
+  resolveMemberCall,
+  resolveFreeCall,
+  type OverloadHints,
+} from '../../src/core/ingestion/call-processor.js';
+
+describe('resolveMemberCall', () => {
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    ctx = createResolutionContext();
+  });
+
+  it('resolves direct method on owner type', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:User:save');
+    expect(result!.returnType).toBe('void');
+    expect(result!.confidence).toBeGreaterThan(0);
+  });
+
+  it('resolves inherited method via MRO walk', () => {
+    ctx.symbols.add('src/parent.java', 'Parent', 'class:Parent', 'Class');
+    ctx.symbols.add('src/child.java', 'Child', 'class:Child', 'Class');
+    ctx.symbols.add('src/parent.java', 'validate', 'method:Parent:validate', 'Method', {
+      returnType: 'boolean',
+      ownerId: 'class:Parent',
+    });
+    ctx.importMap.set('src/app.java', new Set(['src/child.java', 'src/parent.java']));
+
+    const heritage: ExtractedHeritage[] = [
+      { filePath: 'src/child.java', className: 'Child', parentName: 'Parent', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('Child', 'validate', 'src/app.java', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:Parent:validate');
+    expect(result!.returnType).toBe('boolean');
+  });
+
+  it('returns null for unknown owner type', () => {
+    const result = resolveMemberCall('NonExistent', 'save', 'src/app.ts', ctx);
+    expect(result).toBeNull();
+  });
+
+  it('returns null for unknown method on known owner', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveMemberCall('User', 'nonExistentMethod', 'src/app.ts', ctx);
+    expect(result).toBeNull();
+  });
+
+  it('returns result with correct confidence tier for same-file resolution', () => {
+    ctx.symbols.add('src/app.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/app.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.95); // same-file tier
+    expect(result!.reason).toBe('same-file');
+  });
+
+  it('returns result with import-scoped tier for cross-file resolution', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.9); // import-scoped tier
+    expect(result!.reason).toBe('import-resolved');
+  });
+
+  it('resolves with heritage map across C3 MRO chain (Python)', () => {
+    ctx.symbols.add('src/a.py', 'A', 'class:A', 'Class');
+    ctx.symbols.add('src/b.py', 'B', 'class:B', 'Class');
+    ctx.symbols.add('src/c.py', 'C', 'class:C', 'Class');
+    ctx.symbols.add('src/a.py', 'foo', 'method:A:foo', 'Method', {
+      returnType: 'str',
+      ownerId: 'class:A',
+    });
+    ctx.importMap.set('src/main.py', new Set(['src/a.py', 'src/b.py', 'src/c.py']));
+
+    const heritage: ExtractedHeritage[] = [
+      { filePath: 'src/c.py', className: 'C', parentName: 'B', kind: 'extends' },
+      { filePath: 'src/b.py', className: 'B', parentName: 'A', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('C', 'foo', 'src/main.py', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:A:foo');
+    expect(result!.returnType).toBe('str');
+  });
+
+  // -------------------------------------------------------------------------
+  // Locks in the B2 semantic change: tier reflects how the OWNER TYPE was
+  // resolved, not how the method name was resolved globally.
+  // -------------------------------------------------------------------------
+  it('uses owner-type tier: cross-file class resolution → import-scoped confidence', () => {
+    // Scenario: owner class 'User' is defined in user.ts (imported from app.ts).
+    // The method 'save' exists ONLY on User (no homonyms). Old behaviour would
+    // have used the tier of resolving "save" globally; new behaviour uses the
+    // tier of resolving "User". Both happen to yield import-scoped here —
+    // the test locks that the reported tier tracks the class lookup.
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.9); // import-scoped
+    expect(result!.reason).toBe('import-resolved');
+  });
+
+  // -------------------------------------------------------------------------
+  // T2: Rust qualified-syntax — trait-inherited methods must return null
+  // because they require `TraitName::method(obj)` call syntax, not `obj.method()`.
+  // Only struct's OWN impl methods are reachable via direct member calls.
+  // -------------------------------------------------------------------------
+  it('Rust: returns null for trait-inherited method (qualified-syntax MRO)', () => {
+    // Trait Writer defines `save`. Struct User has an impl_item but NO save
+    // method of its own — save is only available via trait.
+    ctx.symbols.add('src/writer.rs', 'Writer', 'trait:Writer', 'Trait');
+    ctx.symbols.add('src/user.rs', 'User', 'struct:User', 'Struct');
+    ctx.symbols.add('src/writer.rs', 'save', 'method:Writer:save', 'Method', {
+      returnType: 'bool',
+      ownerId: 'trait:Writer',
+    });
+    ctx.importMap.set('src/app.rs', new Set(['src/writer.rs', 'src/user.rs']));
+
+    const heritage: ExtractedHeritage[] = [
+      // User implements Writer — in Rust this is `impl Writer for User`.
+      { filePath: 'src/user.rs', className: 'User', parentName: 'Writer', kind: 'implements' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    // Rust's qualified-syntax strategy short-circuits trait inheritance walks,
+    // so `user.save()` (direct call) does not resolve.
+    const result = resolveMemberCall('User', 'save', 'src/app.rs', ctx, map);
+    expect(result).toBeNull();
+  });
+
+  it('Rust: direct impl methods still resolve (distinction check for T2)', () => {
+    // Positive control: a method defined directly on User (not via trait)
+    // resolves normally — demonstrates the null in the previous test is
+    // specifically due to the trait-inheritance path, not a broken fixture.
+    ctx.symbols.add('src/user.rs', 'User', 'struct:User', 'Struct');
+    ctx.symbols.add('src/user.rs', 'name', 'method:User:name', 'Method', {
+      returnType: 'String',
+      ownerId: 'struct:User',
+    });
+    ctx.importMap.set('src/app.rs', new Set(['src/user.rs']));
+
+    const result = resolveMemberCall('User', 'name', 'src/app.rs', ctx);
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:User:name');
+    expect(result!.returnType).toBe('String');
+  });
+
+  // -------------------------------------------------------------------------
+  // T3: C/C++ leftmost-base diamond inheritance at the resolveMemberCall layer.
+  // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Homonym disambiguation: when two class candidates share a name but only
+  // ONE of them owns the method, resolveMemberCall should return that one
+  // without falling through to the fuzzy D2 widening path. Absorbs what was
+  // previously D4's ownerId-filtering job into the owner-scoped path.
+  // -------------------------------------------------------------------------
+  it('disambiguates homonym classes: only one owns the method', () => {
+    // Two classes both named `User` — one in auth.py (has `save`), one in
+    // legacy.py (has `archive` but no `save`). Both are imported from app.py.
+    ctx.symbols.add('src/auth.py', 'User', 'class:auth:User', 'Class');
+    ctx.symbols.add('src/auth.py', 'save', 'method:auth:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:auth:User',
+    });
+    ctx.symbols.add('src/legacy.py', 'User', 'class:legacy:User', 'Class');
+    ctx.symbols.add('src/legacy.py', 'archive', 'method:legacy:User:archive', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:legacy:User',
+    });
+    ctx.importMap.set('src/app.py', new Set(['src/auth.py', 'src/legacy.py']));
+
+    // `user.save()` is unambiguous — only auth.User has `save`.
+    const saveResult = resolveMemberCall('User', 'save', 'src/app.py', ctx);
+    expect(saveResult).not.toBeNull();
+    expect(saveResult!.nodeId).toBe('method:auth:User:save');
+
+    // `user.archive()` is also unambiguous — only legacy.User has `archive`.
+    const archiveResult = resolveMemberCall('User', 'archive', 'src/app.py', ctx);
+    expect(archiveResult).not.toBeNull();
+    expect(archiveResult!.nodeId).toBe('method:legacy:User:archive');
+  });
+
+  it('returns null when homonym classes BOTH own the method (genuine ambiguity)', () => {
+    // Both homonym Users define a `save` method — resolveMemberCall refuses
+    // to pick one. The caller (resolveCallTarget) falls through to D1-D4 which
+    // may or may not be able to narrow further.
+    ctx.symbols.add('src/auth.py', 'User', 'class:auth:User', 'Class');
+    ctx.symbols.add('src/auth.py', 'save', 'method:auth:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:auth:User',
+    });
+    ctx.symbols.add('src/legacy.py', 'User', 'class:legacy:User', 'Class');
+    ctx.symbols.add('src/legacy.py', 'save', 'method:legacy:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:legacy:User',
+    });
+    ctx.importMap.set('src/app.py', new Set(['src/auth.py', 'src/legacy.py']));
+
+    const result = resolveMemberCall('User', 'save', 'src/app.py', ctx);
+    expect(result).toBeNull();
+  });
+
+  it('homonym + shared ancestor: both walk MRO to the same method (dedups to 1)', () => {
+    // Two homonym `User` classes in different files, both extending a common
+    // `BaseUser` that owns `save`. Direct lookup on either User misses; MRO
+    // walks both find BaseUser.save. Dedup by nodeId yields a single result.
+    ctx.symbols.add('src/base.ts', 'BaseUser', 'class:BaseUser', 'Class');
+    ctx.symbols.add('src/base.ts', 'save', 'method:BaseUser:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:BaseUser',
+    });
+    ctx.symbols.add('src/a.ts', 'User', 'class:a:User', 'Class');
+    ctx.symbols.add('src/b.ts', 'User', 'class:b:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/base.ts', 'src/a.ts', 'src/b.ts']));
+
+    const heritage: ExtractedHeritage[] = [
+      { filePath: 'src/a.ts', className: 'User', parentName: 'BaseUser', kind: 'extends' },
+      { filePath: 'src/b.ts', className: 'User', parentName: 'BaseUser', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx, map);
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:BaseUser:save');
+  });
+
+  it('C++: resolves diamond inheritance via leftmost-base MRO', () => {
+    // Diamond:
+    //        Base
+    //        / \
+    //       A   B
+    //        \ /
+    //      Derived
+    //
+    // Both A and B inherit `method` from Base. Derived extends (A, B).
+    // Leftmost-base strategy walks A's chain first → finds Base::method.
+    ctx.symbols.add('src/base.h', 'Base', 'class:Base', 'Class');
+    ctx.symbols.add('src/a.h', 'A', 'class:A', 'Class');
+    ctx.symbols.add('src/b.h', 'B', 'class:B', 'Class');
+    ctx.symbols.add('src/derived.h', 'Derived', 'class:Derived', 'Class');
+    ctx.symbols.add('src/base.h', 'method', 'method:Base:method', 'Method', {
+      returnType: 'int',
+      ownerId: 'class:Base',
+    });
+    ctx.importMap.set(
+      'src/app.cpp',
+      new Set(['src/base.h', 'src/a.h', 'src/b.h', 'src/derived.h']),
+    );
+
+    const heritage: ExtractedHeritage[] = [
+      { filePath: 'src/a.h', className: 'A', parentName: 'Base', kind: 'extends' },
+      { filePath: 'src/b.h', className: 'B', parentName: 'Base', kind: 'extends' },
+      { filePath: 'src/derived.h', className: 'Derived', parentName: 'A', kind: 'extends' },
+      { filePath: 'src/derived.h', className: 'Derived', parentName: 'B', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('Derived', 'method', 'src/app.cpp', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:Base:method');
+    expect(result!.returnType).toBe('int');
+  });
+
+  // -------------------------------------------------------------------------
+  // L1: C# / Kotlin implements-split strategy through resolveMemberCall.
+  // lookupMethodByOwnerWithMRO already has strategy-level coverage for these
+  // languages; these tests add the resolveMemberCall layer (tier resolution
+  // + class candidate iteration + MRO walk) on top.
+  // -------------------------------------------------------------------------
+  it('C#: walks implements-split to find inherited method via interface', () => {
+    // C# uses implements-split MRO: class base chain walked first, then
+    // interfaces. Here IService declares Save which is implemented by the
+    // base class BaseService — MyService inherits Save through the class.
+    ctx.symbols.add('src/iservice.cs', 'IService', 'interface:IService', 'Interface');
+    ctx.symbols.add('src/base.cs', 'BaseService', 'class:BaseService', 'Class');
+    ctx.symbols.add('src/my.cs', 'MyService', 'class:MyService', 'Class');
+    ctx.symbols.add('src/base.cs', 'Save', 'method:BaseService:Save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:BaseService',
+    });
+    ctx.importMap.set('src/app.cs', new Set(['src/iservice.cs', 'src/base.cs', 'src/my.cs']));
+
+    const heritage: ExtractedHeritage[] = [
+      {
+        filePath: 'src/base.cs',
+        className: 'BaseService',
+        parentName: 'IService',
+        kind: 'implements',
+      },
+      { filePath: 'src/my.cs', className: 'MyService', parentName: 'BaseService', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('MyService', 'Save', 'src/app.cs', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:BaseService:Save');
+    expect(result!.returnType).toBe('void');
+  });
+
+  it('Kotlin: walks implements-split to find inherited method via interface', () => {
+    // Kotlin shares the implements-split MRO strategy with Java/C#. A class
+    // inheriting from an interface that provides a default method should
+    // resolve `obj.method()` to the interface's implementation.
+    ctx.symbols.add('src/validator.kt', 'Validator', 'interface:Validator', 'Interface');
+    ctx.symbols.add('src/user.kt', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/validator.kt', 'validate', 'method:Validator:validate', 'Method', {
+      returnType: 'Boolean',
+      ownerId: 'interface:Validator',
+    });
+    ctx.importMap.set('src/app.kt', new Set(['src/validator.kt', 'src/user.kt']));
+
+    const heritage: ExtractedHeritage[] = [
+      {
+        filePath: 'src/user.kt',
+        className: 'User',
+        parentName: 'Validator',
+        kind: 'implements',
+      },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('User', 'validate', 'src/app.kt', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:Validator:validate');
+    expect(result!.returnType).toBe('Boolean');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T1: D0 skip-condition tests — verify resolveCallTarget bypasses the
+// resolveMemberCall fast path when overloadHints, preComputedArgTypes, or a
+// module alias is active.
+// ---------------------------------------------------------------------------
+
+describe('resolveCallTarget D0 skip conditions (SM-11)', () => {
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    ctx = createResolutionContext();
+  });
+
+  it('module alias: picks alias-scoped class over homonym (D0 actually bypassed)', () => {
+    // Python-style: `import auth; auth.User.save()` where BOTH auth.py and
+    // other.py define a `User` class with a `save` method. The test proves:
+    //
+    //   1. Without the alias: resolveMemberCall sees two homonym Users,
+    //      both own `save`, and correctly returns null (refuses to guess).
+    //   2. With the alias: D0 is skipped via `hasActiveModuleAlias`, and
+    //      D1-D4 — respecting the alias-narrowed filteredCandidates — picks
+    //      the auth.py User.save method.
+    //
+    // A regression where D0 silently ran would produce null (ambiguous)
+    // instead of the correct answer, so this test actually exercises the
+    // skip path rather than just verifying a single-candidate happy path.
+    ctx.symbols.add('src/auth.py', 'User', 'class:auth:User', 'Class');
+    ctx.symbols.add('src/auth.py', 'save', 'method:auth:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:auth:User',
+    });
+    ctx.symbols.add('src/other.py', 'User', 'class:other:User', 'Class');
+    ctx.symbols.add('src/other.py', 'save', 'method:other:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:other:User',
+    });
+    ctx.importMap.set('src/app.py', new Set(['src/auth.py', 'src/other.py']));
+    ctx.moduleAliasMap.set('src/app.py', new Map([['auth', 'src/auth.py']]));
+
+    // Control: without alias narrowing, resolveMemberCall sees both Users
+    // own `save` and correctly refuses to pick one.
+    const ambiguous = resolveMemberCall('User', 'save', 'src/app.py', ctx);
+    expect(ambiguous).toBeNull();
+
+    // With alias narrowing active, D0 is skipped and D1-D4 picks auth.py's
+    // User.save because the alias block already narrowed filteredCandidates
+    // to auth.py (and the D2 widening step is gated on `!aliasNarrowed`).
+    const aliased = _resolveCallTargetForTesting(
+      {
+        calledName: 'save',
+        callForm: 'member',
+        receiverTypeName: 'User',
+        receiverName: 'auth', // triggers hasActiveModuleAlias → D0 skipped
+      },
+      'src/app.py',
+      ctx,
+    );
+
+    expect(aliased).not.toBeNull();
+    expect(aliased!.nodeId).toBe('method:auth:User:save');
+  });
+
+  it('overloadHints present: D0 bypassed, D1-D4 handles resolution', () => {
+    // When overloadHints is supplied, the D0 fast path must be skipped
+    // because lookupMethodByOwner does not consider argument types and
+    // would pick an arbitrary overload for same-return-type overloads.
+    //
+    // This test verifies that the skip does not break resolution: passing
+    // a dummy overloadHints object should still yield the correct method
+    // via the D1-D4 path.
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    // Minimal stub; D1-D4 only calls tryOverloadDisambiguation when there are
+    // multiple candidates, so an empty object is fine for single-candidate cases.
+    const dummyHints = {} as OverloadHints;
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'save',
+        callForm: 'member',
+        receiverTypeName: 'User',
+      },
+      'src/app.ts',
+      ctx,
+      { overloadHints: dummyHints },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:User:save');
+  });
+
+  it('preComputedArgTypes present: D0 bypassed, D1-D4 handles resolution', () => {
+    // Analogous to the overloadHints case: when preComputedArgTypes is supplied
+    // (worker path), D0 must be skipped so that type-based overload
+    // disambiguation in D1-D4 is authoritative.
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'save',
+        callForm: 'member',
+        receiverTypeName: 'User',
+        argCount: 0,
+      },
+      'src/app.ts',
+      ctx,
+      { preComputedArgTypes: [] },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:User:save');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveStaticCall — SM-12: constructor/static call resolution
+// ---------------------------------------------------------------------------
+
+import { resolveStaticCall } from '../../src/core/ingestion/call-processor.js';
+
+describe('resolveStaticCall', () => {
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    ctx = createResolutionContext();
+  });
+
+  it('resolves constructor with ownerId via lookupMethodByOwner', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User', 'Constructor', {
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:User');
+  });
+
+  it('returns class node when no constructor exists', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:User');
+  });
+
+  it('returns null for non-class symbol', () => {
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper', 'Function');
+    ctx.importMap.set('src/app.ts', new Set(['src/utils.ts']));
+
+    const result = resolveStaticCall('helper', 'src/app.ts', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('returns null when className does not exist', () => {
+    const result = resolveStaticCall('NonExistent', 'src/app.ts', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('returns null when Constructor nodes lack ownerId', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User', 'Constructor', {
+      parameterCount: 1,
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    // Constructor lacks ownerId, so lookupMethodByOwner won't find it.
+    // resolveStaticCall detects Constructor nodes and returns null to
+    // let filterCallableCandidates handle the Constructor-vs-Class preference.
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('disambiguates constructor by arity', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User:0', 'Constructor', {
+      parameterCount: 0,
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User:2', 'Constructor', {
+      parameterCount: 2,
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx, 2);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:User:2');
+  });
+
+  it('returns correct confidence tier for import-scoped class', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.9); // import-scoped tier
+    expect(result!.reason).toBe('import-resolved');
+  });
+
+  it('returns correct confidence tier for same-file class', () => {
+    ctx.symbols.add('src/app.ts', 'User', 'class:User', 'Class');
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.95); // same-file tier
+    expect(result!.reason).toBe('same-file');
+  });
+
+  it('returns null for ambiguous homonym classes without constructor', () => {
+    ctx.symbols.add('src/a.ts', 'User', 'class:a:User', 'Class');
+    ctx.symbols.add('src/b.ts', 'User', 'class:b:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/a.ts', 'src/b.ts']));
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx);
+
+    // Two classes with same name — ambiguous, should return null
+    expect(result).toBeNull();
+  });
+
+  it('routes through resolveCallTarget for constructor callForm', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'constructor',
+      },
+      'src/app.ts',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:User');
+  });
+
+  it('routes through resolveCallTarget for free-form call targeting a class (Swift/Kotlin)', () => {
+    ctx.symbols.add('src/user.swift', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.swift', new Set(['src/user.swift']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'free',
+      },
+      'src/app.swift',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:User');
+  });
+
+  it('reuses the pre-computed tiered result instead of calling ctx.resolve twice', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User', 'Constructor', {
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    // Spy on ctx.resolve to prove the override short-circuits the second lookup.
+    const originalResolve = ctx.resolve.bind(ctx);
+    let resolveCallCount = 0;
+    ctx.resolve = ((name: string, fromFile: string) => {
+      resolveCallCount++;
+      return originalResolve(name, fromFile);
+    }) as typeof ctx.resolve;
+
+    const tieredOverride = originalResolve('User', 'src/app.ts');
+    expect(tieredOverride).not.toBeNull();
+    resolveCallCount = 0; // reset after the setup call
+
+    const result = resolveStaticCall('User', 'src/app.ts', ctx, undefined, tieredOverride!);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:User');
+    expect(resolveCallCount).toBe(0); // ctx.resolve must not have been called again
+  });
+
+  it('routes through resolveCallTarget for Java constructor call (new User())', () => {
+    ctx.symbols.add('src/User.java', 'User', 'class:java:User', 'Class');
+    ctx.symbols.add('src/User.java', 'User', 'ctor:java:User', 'Constructor', {
+      returnType: 'User',
+      ownerId: 'class:java:User',
+    });
+    ctx.importMap.set('src/App.java', new Set(['src/User.java']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'constructor',
+      },
+      'src/App.java',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    // Prefers Constructor node over Class node when ownerId is present.
+    expect(result!.nodeId).toBe('ctor:java:User');
+  });
+
+  it('routes through resolveCallTarget for Python free-form constructor (User())', () => {
+    ctx.symbols.add('models/user.py', 'User', 'class:py:User', 'Class');
+    ctx.importMap.set('app.py', new Set(['models/user.py']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'free',
+      },
+      'app.py',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:py:User');
+  });
+
+  it('routes through resolveCallTarget for Kotlin free-form constructor (User())', () => {
+    ctx.symbols.add('src/User.kt', 'User', 'class:kt:User', 'Class');
+    ctx.importMap.set('src/App.kt', new Set(['src/User.kt']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'free',
+      },
+      'src/App.kt',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:kt:User');
+  });
+
+  // -------------------------------------------------------------------------
+  // Instantiability guard (Codex review follow-up, plan 2026-04-09-002):
+  // The step-5 class-node fallback must only return instantiable kinds
+  // (Class / Struct / Record). Interface / Trait / Impl / Enum targets are
+  // null-routed to prevent false CALLS edges to non-instantiable nodes.
+  // -------------------------------------------------------------------------
+
+  it('returns a Struct node when no constructor exists (positive regression guard)', () => {
+    ctx.symbols.add('src/user.rs', 'User', 'struct:User', 'Struct');
+    ctx.importMap.set('src/app.rs', new Set(['src/user.rs']));
+
+    const result = resolveStaticCall('User', 'src/app.rs', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('struct:User');
+  });
+
+  it('returns a Record node when no constructor exists (positive regression guard)', () => {
+    ctx.symbols.add('src/User.cs', 'User', 'record:User', 'Record');
+    ctx.importMap.set('src/App.cs', new Set(['src/User.cs']));
+
+    const result = resolveStaticCall('User', 'src/App.cs', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('record:User');
+  });
+
+  it('null-routes when the sole candidate is an Interface (Java/C#/TS)', () => {
+    // Constructor-shaped call on an interface name — not legal source, but
+    // the resolver must refuse to emit a CALLS edge to a non-instantiable node.
+    ctx.symbols.add('src/validator.java', 'IValidator', 'iface:IValidator', 'Interface');
+    ctx.importMap.set('src/app.java', new Set(['src/validator.java']));
+
+    const result = resolveStaticCall('IValidator', 'src/app.java', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('null-routes when the sole candidate is a Trait (PHP/Rust/Scala)', () => {
+    // PHP `HasTimestamps` trait — not instantiable via constructor syntax.
+    ctx.symbols.add('src/timestamps.php', 'HasTimestamps', 'trait:HasTimestamps', 'Trait');
+    ctx.importMap.set('src/model.php', new Set(['src/timestamps.php']));
+
+    const result = resolveStaticCall('HasTimestamps', 'src/model.php', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('null-routes when the sole candidate is a Rust Trait (Display)', () => {
+    ctx.symbols.add('src/fmt.rs', 'Display', 'trait:rs:Display', 'Trait');
+    ctx.importMap.set('src/app.rs', new Set(['src/fmt.rs']));
+
+    const result = resolveStaticCall('Display', 'src/app.rs', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('prefers the Struct over the Impl when both share the same name and file (Rust shadowing)', () => {
+    // Rust `impl User { ... }` alongside `struct User { ... }` in the same file.
+    // Same-file tier returns both via lookupExactAll, both pass CLASS_LIKE_TYPES,
+    // but the instantiability filter must strip the Impl so the Struct wins.
+    ctx.symbols.add('src/user.rs', 'User', 'struct:rs:User', 'Struct');
+    ctx.symbols.add('src/user.rs', 'User', 'impl:rs:User', 'Impl');
+
+    const result = resolveStaticCall('User', 'src/user.rs', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('struct:rs:User');
+  });
+
+  it('null-routes when the sole candidate is a Rust Impl block (no Struct present)', () => {
+    // Pathological extractor output: only the Impl survives tier resolution.
+    // The instantiability filter must reject it rather than emit a wrong edge.
+    ctx.symbols.add('src/user.rs', 'User', 'impl:rs:User', 'Impl');
+
+    const result = resolveStaticCall('User', 'src/user.rs', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('still returns an explicit Constructor even when the owner is an Impl (step-3 preservation)', () => {
+    // Step 3 (lookupMethodByOwner walk) must not be affected by the step-5
+    // tightening — a legitimate Constructor node owned by an Impl in a Rust
+    // extractor still resolves correctly. The Struct is also present so that
+    // step-1's lookupClassByName pre-check succeeds (Impl alone isn't in the
+    // classByName index).
+    ctx.symbols.add('src/user.rs', 'User', 'struct:rs:User', 'Struct');
+    ctx.symbols.add('src/user.rs', 'User', 'impl:rs:User', 'Impl');
+    ctx.symbols.add('src/user.rs', 'User', 'ctor:rs:User', 'Constructor', {
+      returnType: 'User',
+      ownerId: 'impl:rs:User',
+    });
+    ctx.importMap.set('src/app.rs', new Set(['src/user.rs']));
+
+    const result = resolveStaticCall('User', 'src/app.rs', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:rs:User');
+  });
+
+  it('routes through resolveCallTarget and null-routes Interface constructor-shaped calls', () => {
+    ctx.symbols.add('src/validator.java', 'IValidator', 'iface:IValidator', 'Interface');
+    ctx.importMap.set('src/app.java', new Set(['src/validator.java']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'IValidator',
+        callForm: 'constructor',
+      },
+      'src/app.java',
+      ctx,
+    );
+
+    // Full cascade: S0 → resolveStaticCall → step-5 instantiability filter → null.
+    // If any downstream path silently re-introduces the wrong edge, this fails.
+    expect(result).toBeNull();
+  });
+
+  it('routes through resolveCallTarget and null-routes Trait free-form calls', () => {
+    ctx.symbols.add('src/timestamps.php', 'HasTimestamps', 'trait:HasTimestamps', 'Trait');
+    ctx.importMap.set('src/model.php', new Set(['src/timestamps.php']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'HasTimestamps',
+        callForm: 'free',
+      },
+      'src/model.php',
+      ctx,
+    );
+
+    expect(result).toBeNull();
+  });
+
+  it('routes Record free-form constructor call through S0 (C# record / Kotlin data class)', () => {
+    // Verifies that `freeFormHasClassTarget` triggers S0 for Record candidates.
+    // Before the alignment fix, `Record` was absent from the trigger `.some()`,
+    // so S0 was bypassed and Record free-form calls fell through to the
+    // constructor-form retry path. This test would have silently passed with
+    // the old (wasteful) code path — with the fix, S0 resolves it directly.
+    ctx.symbols.add('src/User.cs', 'User', 'record:cs:User', 'Record');
+    ctx.importMap.set('src/App.cs', new Set(['src/User.cs']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'free',
+      },
+      'src/App.cs',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('record:cs:User');
+  });
+
+  it('threads argCount through resolveCallTarget → S0 → resolveStaticCall for arity disambiguation', () => {
+    // Regression guard: if call.argCount were ever dropped at the S0 call
+    // site, the 2-arg constructor would resolve to the 0-arg overload (or
+    // return null via ambiguity). This test fails in either case.
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User:0', 'Constructor', {
+      parameterCount: 0,
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User:2', 'Constructor', {
+      parameterCount: 2,
+      returnType: 'User',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'User',
+        callForm: 'constructor',
+        argCount: 2,
+      },
+      'src/app.ts',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:User:2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveFreeCall — SM-13: free-function call resolution
+// ---------------------------------------------------------------------------
+
+describe('resolveFreeCall', () => {
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    ctx = createResolutionContext();
+  });
+
+  it('resolves a free function call via import-scoped resolution', () => {
+    ctx.symbols.add('src/utils.ts', 'doStuff', 'func:doStuff', 'Function');
+    ctx.importMap.set('src/app.ts', new Set(['src/utils.ts']));
+
+    const result = resolveFreeCall('doStuff', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:doStuff');
+    expect(result!.confidence).toBe(0.9); // import-scoped tier
+    expect(result!.reason).toBe('import-resolved');
+  });
+
+  it('resolves a free function call via same-file resolution', () => {
+    ctx.symbols.add('src/app.ts', 'helper', 'func:helper', 'Function');
+
+    const result = resolveFreeCall('helper', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:helper');
+    expect(result!.confidence).toBe(0.95); // same-file tier
+    expect(result!.reason).toBe('same-file');
+  });
+
+  it('returns null when no candidates exist', () => {
+    const result = resolveFreeCall('nonexistent', 'src/app.ts', ctx);
+    expect(result).toBeNull();
+  });
+
+  it('returns null for ambiguous free function calls (multiple candidates)', () => {
+    ctx.symbols.add('src/a.ts', 'doStuff', 'func:a:doStuff', 'Function');
+    ctx.symbols.add('src/b.ts', 'doStuff', 'func:b:doStuff', 'Function');
+    ctx.importMap.set('src/app.ts', new Set(['src/a.ts', 'src/b.ts']));
+
+    const result = resolveFreeCall('doStuff', 'src/app.ts', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('delegates to resolveStaticCall for free-form class targets (Swift/Kotlin)', () => {
+    ctx.symbols.add('src/user.swift', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.swift', new Set(['src/user.swift']));
+
+    const result = resolveFreeCall('User', 'src/app.swift', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:User');
+  });
+
+  it('delegates to resolveStaticCall for Record free-form targets (C#/Kotlin)', () => {
+    ctx.symbols.add('src/User.cs', 'User', 'record:cs:User', 'Record');
+    ctx.importMap.set('src/App.cs', new Set(['src/User.cs']));
+
+    const result = resolveFreeCall('User', 'src/App.cs', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('record:cs:User');
+  });
+
+  it('null-routes Trait free-form calls via resolveStaticCall', () => {
+    ctx.symbols.add('src/timestamps.php', 'HasTimestamps', 'trait:HasTimestamps', 'Trait');
+    ctx.importMap.set('src/model.php', new Set(['src/timestamps.php']));
+
+    const result = resolveFreeCall('HasTimestamps', 'src/model.php', ctx);
+
+    expect(result).toBeNull();
+  });
+
+  it('uses tieredOverride when provided', () => {
+    ctx.symbols.add('src/utils.ts', 'doStuff', 'func:doStuff', 'Function');
+    ctx.importMap.set('src/app.ts', new Set(['src/utils.ts']));
+
+    const tiered = ctx.resolve('doStuff', 'src/app.ts');
+    expect(tiered).not.toBeNull();
+
+    // Spy on ctx.resolve to verify it is NOT called again
+    const originalResolve = ctx.resolve.bind(ctx);
+    let resolveCallCount = 0;
+    ctx.resolve = ((name: string, fromFile: string) => {
+      resolveCallCount++;
+      return originalResolve(name, fromFile);
+    }) as typeof ctx.resolve;
+
+    const result = resolveFreeCall('doStuff', 'src/app.ts', ctx, undefined, tiered!);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:doStuff');
+    expect(resolveCallCount).toBe(0);
+  });
+
+  it('routes through resolveCallTarget for free-form calls', () => {
+    ctx.symbols.add('src/utils.ts', 'doStuff', 'func:doStuff', 'Function');
+    ctx.importMap.set('src/app.ts', new Set(['src/utils.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'doStuff',
+        callForm: 'free',
+      },
+      'src/app.ts',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:doStuff');
+  });
+
+  // -------------------------------------------------------------------------
+  // PR #756 review follow-up (plan 2026-04-09-003): language coverage,
+  // arity threading, Tier 3 resolution, preComputedArgTypes worker path,
+  // Enum null-route, and Swift extension dedup guard.
+  // -------------------------------------------------------------------------
+
+  // R2 — Language coverage: Go, Python, Rust, Java, JavaScript free-function
+  // dispatch through _resolveCallTargetForTesting. resolveFreeCall has no
+  // file-extension branching; these guard the dispatch chain per language.
+
+  it('resolves a Go free function (doStuff())', () => {
+    ctx.symbols.add('src/helper.go', 'doStuff', 'func:go:doStuff', 'Function');
+    ctx.importMap.set('src/main.go', new Set(['src/helper.go']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'doStuff', callForm: 'free' },
+      'src/main.go',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:go:doStuff');
+  });
+
+  it('resolves a Python free function (def helper(): ... helper())', () => {
+    ctx.symbols.add('helpers.py', 'helper', 'func:py:helper', 'Function');
+    ctx.importMap.set('app.py', new Set(['helpers.py']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'helper', callForm: 'free' },
+      'app.py',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:py:helper');
+  });
+
+  it('resolves a Rust free function outside any impl block (free_fn())', () => {
+    ctx.symbols.add('src/helpers.rs', 'free_fn', 'func:rs:free_fn', 'Function');
+    ctx.importMap.set('src/main.rs', new Set(['src/helpers.rs']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'free_fn', callForm: 'free' },
+      'src/main.rs',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:rs:free_fn');
+  });
+
+  it('resolves a Java statically-imported function (doStuff() after import static Utils.doStuff)', () => {
+    // Note: this simulates the extractor output post static import by
+    // indexing the function directly in its declaring file. The test guards
+    // the dispatch chain for .java files, not the extractor's handling of
+    // static imports specifically.
+    ctx.symbols.add('src/Utils.java', 'doStuff', 'func:java:doStuff', 'Function');
+    ctx.importMap.set('src/App.java', new Set(['src/Utils.java']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'doStuff', callForm: 'free' },
+      'src/App.java',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:java:doStuff');
+  });
+
+  it('resolves a JavaScript module-level function (moduleFn())', () => {
+    ctx.symbols.add('src/helpers.js', 'moduleFn', 'func:js:moduleFn', 'Function');
+    ctx.importMap.set('src/app.js', new Set(['src/helpers.js']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'moduleFn', callForm: 'free' },
+      'src/app.js',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:js:moduleFn');
+  });
+
+  // R3 — Arity filtering: call.argCount must narrow overloaded free functions
+  // differing only in parameter count.
+
+  it('narrows overloaded free functions by argCount (2-arg overload selected)', () => {
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper:0', 'Function', {
+      parameterCount: 0,
+    });
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper:2', 'Function', {
+      parameterCount: 2,
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/utils.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'helper', callForm: 'free', argCount: 2 },
+      'src/app.ts',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:helper:2');
+  });
+
+  it('narrows overloaded free functions by argCount (0-arg overload selected)', () => {
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper:0', 'Function', {
+      parameterCount: 0,
+    });
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper:2', 'Function', {
+      parameterCount: 2,
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/utils.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'helper', callForm: 'free', argCount: 0 },
+      'src/app.ts',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:helper:0');
+  });
+
+  // R4 — Tier 3 (global) resolution: function globally visible but not
+  // imported. Locks in TIER_CONFIDENCE.global === 0.5 and reason === 'global'
+  // so a silent tier-table refactor surfaces here.
+
+  it('resolves a globally-visible free function via Tier 3 with global confidence', () => {
+    ctx.symbols.add('lib/global.ts', 'helper', 'func:global:helper', 'Function');
+    // No importMap entry — must fall through to Tier 3 (global).
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'helper', callForm: 'free' },
+      'src/app.ts',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:global:helper');
+    expect(result!.confidence).toBe(0.5); // TIER_CONFIDENCE.global
+    expect(result!.reason).toBe('global');
+  });
+
+  // R5 — preComputedArgTypes worker path: when parse-worker pre-computes
+  // argument types, the disambiguation routes through matchCandidatesByArgTypes.
+  // Preconditions (verified at feasibility review):
+  //   1. filteredCandidates.length > 1 — both overloads must survive arity
+  //      filtering, so argCount left unset here.
+  //   2. overloadHints must be undefined — it takes precedence over
+  //      preComputedArgTypes at the disambiguation site.
+
+  it('disambiguates overloads via preComputedArgTypes (String overload matched)', () => {
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper:str', 'Function', {
+      parameterCount: 1,
+      parameterTypes: ['String'],
+    });
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper:int', 'Function', {
+      parameterCount: 1,
+      parameterTypes: ['Int'],
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/utils.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'helper', callForm: 'free', argCount: 1 },
+      'src/app.ts',
+      ctx,
+      { preComputedArgTypes: ['String'] },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:helper:str');
+  });
+
+  it('disambiguates overloads via preComputedArgTypes (Int overload matched)', () => {
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper:str', 'Function', {
+      parameterCount: 1,
+      parameterTypes: ['String'],
+    });
+    ctx.symbols.add('src/utils.ts', 'helper', 'func:helper:int', 'Function', {
+      parameterCount: 1,
+      parameterTypes: ['Int'],
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/utils.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'helper', callForm: 'free', argCount: 1 },
+      'src/app.ts',
+      ctx,
+      // `Int` is normalized to `int` on the stored side via normalizeJvmTypeName
+      // (matchCandidatesByArgTypes:1287). Real parse-worker-emitted argTypes are
+      // already lowercase primitive names inferred from literals, so this
+      // mirrors production call-site shape.
+      { preComputedArgTypes: ['int'] },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:helper:int');
+  });
+
+  // R6 — Enum free-form null-route: locks in the current behavior that
+  // `Color()`-style calls on Enum types return null because Enum is
+  // deliberately excluded from INSTANTIABLE_CLASS_TYPES. This is intentional
+  // per PR #754 round 1 (see `call-processor.ts` INSTANTIABLE_CLASS_TYPES
+  // JSDoc — "Enum excluded pending language-specific support with motivating
+  // test fixtures"). If a future extension adds Enum to the set, this test
+  // will need to be updated alongside that work — that is the correct signal.
+
+  it('null-routes Enum free-form calls (Color() — no instantiable fallback)', () => {
+    ctx.symbols.add('src/color.ts', 'Color', 'enum:Color', 'Enum');
+    ctx.importMap.set('src/app.ts', new Set(['src/color.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'Color', callForm: 'free' },
+      'src/app.ts',
+      ctx,
+    );
+
+    // Enum not in INSTANTIABLE_CLASS_TYPES → hasClassTarget is false →
+    // resolveStaticCall is not called → tail dedup also doesn't fire →
+    // falls through to the final null return.
+    expect(result).toBeNull();
+  });
+
+  // R7 — Swift extension dedup `filePath.length` heuristic guard:
+  // Two same-name Class entries at different path lengths. The free-form
+  // dispatch chain goes:
+  //   1. filterCallableCandidates(tiered, argCount, 'free') strips Class →
+  //      filteredCandidates.length === 0
+  //   2. hasClassTarget is true (both are Class)
+  //   3. resolveStaticCall runs, has 2 homonym Class candidates →
+  //      instantiableCandidates.length > 1 → returns null (SM-12 round-1
+  //      null-route contract)
+  //   4. Constructor-form retry: filterCallableCandidates(tiered, argCount,
+  //      'constructor') keeps Class entries → filteredCandidates.length === 2
+  //   5. Falls through to the Swift extension dedup block → sorts by
+  //      filePath.length → returns the shortest path.
+
+  it('dedupes Swift extension candidates by shortest file path (free-form retry path)', () => {
+    // Two same-name Class entries, different path lengths.
+    ctx.symbols.add('src/User.swift', 'User', 'class:User:primary', 'Class');
+    ctx.symbols.add('src/Extensions/UserExtensions.swift', 'User', 'class:User:extension', 'Class');
+    ctx.importMap.set(
+      'src/App.swift',
+      new Set(['src/User.swift', 'src/Extensions/UserExtensions.swift']),
+    );
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'User', callForm: 'free' },
+      'src/App.swift',
+      ctx,
+    );
+
+    // The shortest file path wins per the existing heuristic. This is a
+    // behavior guard for finding #4 in the PR #756 review — if the dedup
+    // heuristic changes, this test surfaces that intent.
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('class:User:primary');
+  });
+
+  // -------------------------------------------------------------------------
+  // PR #756 final review follow-up (comment 4215739052):
+  //   - Finding #3 low: ownerless-Constructor retry path (previously covered
+  //     by comment only) — adds the concrete test the reviewer asked for.
+  //   - Low-severity coverage gap: PHP free function (from the language
+  //     coverage table in the same review).
+  // -------------------------------------------------------------------------
+
+  it('routes through resolveStaticCall retry when tiered pool contains an ownerless Constructor (free-form)', () => {
+    // This exercises the third null-return reason documented in the retry
+    // comment inside resolveFreeCall: resolveStaticCall's step-4 bailout when
+    // the tiered pool contains Constructor nodes that lack ownerId (common in
+    // some extractors). In that case:
+    //   1. resolveStaticCall step 3 walks classCandidates via lookupMethodByOwner
+    //      — the ownerless Constructor is NOT in methodByOwner, so nothing found.
+    //   2. Step 4 detects the Constructor in the tiered pool and bails out
+    //      with null so filterCallableCandidates can handle Constructor-vs-
+    //      Class preference correctly.
+    //   3. resolveFreeCall's retry re-runs filterCallableCandidates with
+    //      'constructor' form, which — per CONSTRUCTOR_TARGET_TYPES — prefers
+    //      the Constructor node over the Class node.
+    //   4. Single survivor → returned as the call target.
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'User', 'ctor:User:ownerless', 'Constructor', {
+      parameterCount: 0,
+      // No ownerId — this is the pathological extractor output the retry path
+      // exists to handle.
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'User', callForm: 'free' },
+      'src/app.ts',
+      ctx,
+    );
+
+    // The Constructor survives filterCallableCandidates's 'constructor' form
+    // filter and is preferred over the Class (CONSTRUCTOR_TARGET_TYPES puts
+    // Constructor first). Guards the (c) case in the retry-reasons comment.
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('ctor:User:ownerless');
+  });
+
+  it('resolves a PHP free function (top-level helper())', () => {
+    // PHP allows top-level function definitions outside any class. The
+    // language coverage table in PR #756 review flagged this as uncovered;
+    // this test exercises the `.php` dispatch path for free calls. Matches
+    // the shape of the existing Go/Python/Rust/Java/JS language tests above.
+    ctx.symbols.add('src/helpers.php', 'helper', 'func:php:helper', 'Function');
+    ctx.importMap.set('src/app.php', new Set(['src/helpers.php']));
+
+    const result = _resolveCallTargetForTesting(
+      { calledName: 'helper', callForm: 'free' },
+      'src/app.php',
+      ctx,
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('func:php:helper');
   });
 });

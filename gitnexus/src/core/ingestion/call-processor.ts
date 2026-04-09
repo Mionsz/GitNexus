@@ -1,9 +1,11 @@
 import { KnowledgeGraph } from '../graph/types.js';
 import { ASTCache } from './ast-cache.js';
 import type { SymbolDefinition, SymbolTable } from './symbol-table.js';
+import { CLASS_TYPES } from './symbol-table.js';
 import Parser from 'tree-sitter';
 import type { ResolutionContext } from './resolution-context.js';
 import { TIER_CONFIDENCE, type ResolutionTier } from './resolution-context.js';
+import type { TieredCandidates } from './resolution-context.js';
 import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/parser-loader.js';
 import { getProvider } from './languages/index.js';
 import { generateId } from '../../lib/utils.js';
@@ -53,8 +55,51 @@ import { extractParsedCallSite } from './call-sites/extract-language-call-site.j
  *  Populated during call processing, consumed by Phase 14 re-resolution pass. */
 export type ExportedTypeMap = Map<string, Map<string, string>>;
 
-/** Types that represent class-like declarations (used for receiver/owner resolution). */
-const CLASS_LIKE_TYPES = new Set(['Class', 'Struct', 'Interface', 'Enum', 'Record', 'Impl']);
+/**
+ * Type labels treated as class-like **method-dispatch receivers** by the call
+ * resolver — the set walked by the MRO / heritage path for member and static
+ * method calls.
+ *
+ * Derived from `CLASS_TYPES` (the heritage-index set in symbol-table) plus
+ * `Impl` — Rust `impl` blocks are the definition site of methods for a struct
+ * and must be walkable as receiver-type candidates even though they are not
+ * indexed by `lookupClassByName` (which keys off struct/trait names). Keeping
+ * this set a strict superset of `CLASS_TYPES` guarantees that anything
+ * reachable via `lookupClassByName` also passes this filter, so the two call
+ * paths cannot diverge silently.
+ *
+ * `Interface` is included even though interfaces cannot be directly
+ * instantiated in Java/C#/TypeScript: the resolver still needs to reach
+ * interface nodes for static-method dispatch (`Interface.staticMethod()`) and
+ * default-method resolution via the MRO walker.
+ *
+ * **Do not reuse this set for constructor-fallback filtering.** Constructors
+ * can only instantiate a narrower subset — see `INSTANTIABLE_CLASS_TYPES`
+ * below. `resolveStaticCall`'s step-5 class-node fallback uses the narrower
+ * set to prevent false `CALLS` edges from constructor-shaped calls to
+ * `Interface`, `Trait`, or `Impl` nodes.
+ */
+const CLASS_LIKE_TYPES = new Set<string>([...CLASS_TYPES, 'Impl']);
+
+/**
+ * Type labels that can be the target of a constructor-shaped call when no
+ * explicit `Constructor` symbol is indexed — the "return the type itself as
+ * the call target" fallback set.
+ *
+ * Strict subset of both `CLASS_LIKE_TYPES` and `CONSTRUCTOR_TARGET_TYPES`.
+ * Excludes:
+ *   - `Interface` / `Trait` — not instantiable by definition in any
+ *     supported language.
+ *   - `Impl` — Rust `impl` blocks are method-definition containers, not
+ *     the type itself; the owning `Struct` is the correct target.
+ *   - `Enum` — excluded pending language-specific support with motivating
+ *     test fixtures (matches `CONSTRUCTOR_TARGET_TYPES`).
+ *
+ * Used exclusively by `resolveStaticCall`'s step-5 class-node fallback.
+ * Keep in sync with `CONSTRUCTOR_TARGET_TYPES` (which additionally contains
+ * `'Constructor'` for explicit-constructor-node filtering) when extending.
+ */
+const INSTANTIABLE_CLASS_TYPES = new Set<string>(['Class', 'Struct', 'Record']);
 
 const MAX_EXPORTS_PER_FILE = 500;
 const MAX_TYPE_NAME_LENGTH = 256;
@@ -793,6 +838,8 @@ export const processCalls = async (
           ctx,
           undefined,
           widenCache,
+          undefined,
+          heritageMap,
         );
 
         if (!resolved) return;
@@ -1039,6 +1086,8 @@ export const processCalls = async (
         ctx,
         hints,
         widenCache,
+        undefined,
+        heritageMap,
       );
 
       if (!resolved) return;
@@ -1193,9 +1242,15 @@ const toResolveResult = (definition: SymbolDefinition, tier: ResolutionTier): Re
   returnType: definition.returnType,
 });
 
-/** Optional hints for overload disambiguation via argument literal types.
- *  Only available on the sequential path (has AST); worker path passes undefined. */
-interface OverloadHints {
+/**
+ * Optional hints for overload disambiguation via argument literal types.
+ * Only available on the sequential path (has AST); worker path passes undefined.
+ *
+ * @internal Exported so tests can exercise the D0 skip-condition path without
+ *           constructing a real SyntaxNode. Do not use outside `call-processor.ts`
+ *           and its unit tests.
+ */
+export interface OverloadHints {
   callNode: SyntaxNode;
   inferLiteralType: LiteralTypeInferrer;
   typeEnv?: TypeEnvironment;
@@ -1269,6 +1324,44 @@ const tryOverloadDisambiguation = (
 };
 
 /**
+ * Collapse Swift-extension duplicate Class/Struct candidates to the primary
+ * definition, preferring the shortest file path.
+ *
+ * Swift extensions (`extension User { ... }` in a separate file) create
+ * multiple `Class` nodes sharing the same symbol name — one for the primary
+ * declaration and one per extension file. When overload disambiguation and
+ * receiver narrowing both fail to converge on a single candidate, this
+ * heuristic picks the primary definition based on the assumption that it
+ * lives at the shortest file path (e.g. `User.swift` over `UserExtensions.swift`).
+ *
+ * Intentionally narrower than {@link INSTANTIABLE_CLASS_TYPES}: only `Class`
+ * and `Struct` are considered, not `Record`. Swift extensions only produce
+ * `Class` duplicates in practice, and C#/Kotlin records do not exhibit the
+ * same multi-file-definition pattern, so widening this set risks accidental
+ * dedup of legitimately distinct record types.
+ *
+ * Returns a `ResolveResult` when the heuristic fires, `null` when the
+ * candidate pool does not match the shape (mixed types, non-Class/Struct
+ * kinds, or `length <= 1`). Callers should fall through to their own null
+ * return when this helper returns `null`.
+ *
+ * Shared between `resolveCallTarget` and `resolveFreeCall` — SM-13 originally
+ * duplicated this block into both functions. Having a single source of truth
+ * prevents the two copies from drifting if the heuristic is ever tuned.
+ */
+const dedupSwiftExtensionCandidates = (
+  candidates: readonly SymbolDefinition[],
+  tier: ResolutionTier,
+): ResolveResult | null => {
+  if (candidates.length <= 1) return null;
+  const allSameType = candidates.every((c) => c.type === candidates[0].type);
+  if (!allSameType) return null;
+  if (candidates[0].type !== 'Class' && candidates[0].type !== 'Struct') return null;
+  const sorted = [...candidates].sort((a, b) => a.filePath.length - b.filePath.length);
+  return toResolveResult(sorted[0], tier);
+};
+
+/**
  * Resolve a function call to its target node ID using priority strategy:
  * A. Narrow candidates by scope tier via ctx.resolve()
  * B. Filter to callable symbol kinds (constructor-aware when callForm is set)
@@ -1281,6 +1374,31 @@ const tryOverloadDisambiguation = (
 /** Per-file cache for the widen path's lookupFuzzy calls. Cleared between files. */
 type WidenCache = Map<string, readonly SymbolDefinition[]>;
 
+/** @internal Exported for unit tests of D0 skip conditions (SM-11). Do not use outside tests. */
+export const _resolveCallTargetForTesting = (
+  call: Pick<
+    ExtractedCall,
+    'calledName' | 'argCount' | 'callForm' | 'receiverTypeName' | 'receiverName'
+  >,
+  currentFile: string,
+  ctx: ResolutionContext,
+  opts?: {
+    overloadHints?: OverloadHints;
+    widenCache?: WidenCache;
+    preComputedArgTypes?: (string | undefined)[];
+    heritageMap?: HeritageMap;
+  },
+): ResolveResult | null =>
+  resolveCallTarget(
+    call,
+    currentFile,
+    ctx,
+    opts?.overloadHints,
+    opts?.widenCache,
+    opts?.preComputedArgTypes,
+    opts?.heritageMap,
+  );
+
 const resolveCallTarget = (
   call: Pick<
     ExtractedCall,
@@ -1291,9 +1409,24 @@ const resolveCallTarget = (
   overloadHints?: OverloadHints,
   widenCache?: WidenCache,
   preComputedArgTypes?: (string | undefined)[],
+  heritageMap?: HeritageMap,
 ): ResolveResult | null => {
   const tiered = ctx.resolve(call.calledName, currentFile);
   if (!tiered) return null;
+
+  // SM-13: Free function calls route through resolveFreeCall.
+  // Handles pure free calls (foo()) and Swift/Kotlin implicit constructors (User()).
+  if (call.callForm === 'free') {
+    return resolveFreeCall(
+      call.calledName,
+      currentFile,
+      ctx,
+      call.argCount,
+      tiered,
+      overloadHints,
+      preComputedArgTypes,
+    );
+  }
 
   let filteredCandidates = filterCallableCandidates(
     tiered.candidates,
@@ -1301,20 +1434,28 @@ const resolveCallTarget = (
     call.callForm,
   );
 
-  // Swift/Kotlin: constructor calls look like free function calls (no `new` keyword).
-  // If free-form filtering found no callable candidates but the symbol resolves to a
-  // Class/Struct, retry with constructor form so CONSTRUCTOR_TARGET_TYPES applies.
-  if (filteredCandidates.length === 0 && call.callForm === 'free') {
-    const hasTypeTarget = tiered.candidates.some(
-      (c) => c.type === 'Class' || c.type === 'Struct' || c.type === 'Enum',
+  // S0. Constructor/static fast path (SM-12): O(1) class + constructor lookup
+  //     via lookupClassByName + lookupMethodByOwner.
+  //     Handles callForm === 'constructor' — explicit `new User()` in Java/TS/C#/etc.
+  //     Free-form class targets (Swift/Kotlin `User()`) are handled by
+  //     resolveFreeCall above (SM-13).
+  //
+  //     Known gaps (handled by the existing tail fallback at the bottom of
+  //     this function, not S0):
+  //     - `callForm === 'member'` constructor patterns (e.g. Python
+  //       `models.User()` after `import models`, Ruby `User.new`). Extending
+  //       S0 to cover them would require threading receiver-type resolution
+  //       through the module-alias logic; revisit if it shows up as a hot
+  //       spot.
+  if (call.callForm === 'constructor') {
+    const staticResult = resolveStaticCall(
+      call.calledName,
+      currentFile,
+      ctx,
+      call.argCount,
+      tiered,
     );
-    if (hasTypeTarget) {
-      filteredCandidates = filterCallableCandidates(
-        tiered.candidates,
-        call.argCount,
-        'constructor',
-      );
-    }
+    if (staticResult) return staticResult;
   }
 
   // Module-qualified constructor pattern: e.g. Python `import models; models.User()`.
@@ -1329,6 +1470,10 @@ const resolveCallTarget = (
   // selects auth.py via moduleAliasMap. Runs for ALL member calls with a known module alias,
   // not just ambiguous ones — same-file tier may shadow the correct cross-module target when
   // the caller defines a function with the same name as the callee (Issue #417).
+  //
+  // Tracks `aliasNarrowed` so the D2 widening step below does NOT undo the alias filtering
+  // by calling lookupFuzzy again (which would re-introduce homonym candidates from other files).
+  let aliasNarrowed = false;
   if (call.callForm === 'member' && call.receiverName) {
     const aliasMap = ctx.moduleAliasMap?.get(currentFile);
     if (aliasMap) {
@@ -1337,6 +1482,7 @@ const resolveCallTarget = (
         const aliasFiltered = filteredCandidates.filter((c) => c.filePath === moduleFile);
         if (aliasFiltered.length > 0) {
           filteredCandidates = aliasFiltered;
+          aliasNarrowed = true;
         } else {
           // Same-file tier returned a local match, but the alias points elsewhere.
           // Widen to global candidates and filter to the aliased module's file.
@@ -1351,7 +1497,10 @@ const resolveCallTarget = (
           const widened = filterCallableCandidates(fuzzyDefs, call.argCount, call.callForm).filter(
             (c) => c.filePath === moduleFile,
           );
-          if (widened.length > 0) filteredCandidates = widened;
+          if (widened.length > 0) {
+            filteredCandidates = widened;
+            aliasNarrowed = true;
+          }
         }
       }
     }
@@ -1366,6 +1515,47 @@ const resolveCallTarget = (
   // belong to the wrong class (e.g. super.save() should hit the parent's save,
   // not the child's own save method in the same file).
   if (call.callForm === 'member' && call.receiverTypeName) {
+    // D0. Delegate to resolveMemberCall (SM-11): owner-scoped + MRO lookup
+    //     before falling back to the expensive D1-D4 fuzzy widening.
+    //     Skip conditions:
+    //     (a) overloadHints or preComputedArgTypes present — the MRO lookup may
+    //         pick the wrong overload for same-return-type overloads since it
+    //         does not consider argument types. D1-D4+E handles those correctly.
+    //     (b) A module alias on call.receiverName is active for this file — the
+    //         alias block above already narrowed `filteredCandidates` to a
+    //         specific file. resolveMemberCall re-resolves `receiverTypeName`
+    //         from scratch via `ctx.resolve`, which ignores that narrowing and
+    //         could pick a homonymous class from the wrong file. Fall through to
+    //         D1-D4 which respects the alias-filtered candidate pool.
+    // D0 skip for overload disambiguation: only fires when the name actually
+    // has multiple candidates in the tiered pool. The sequential path sets
+    // `overloadHints` for every call regardless of whether the method is
+    // overloaded — skipping D0 unconditionally would make this fast path
+    // dead code for the sequential pipeline. By gating on
+    // `filteredCandidates.length > 1`, we preserve the original intent
+    // (let D1-D4+E pick the right overload when there are multiple) while
+    // allowing D0 to fire for the common single-candidate case.
+    const hasOverloadConcern =
+      (!!overloadHints || !!preComputedArgTypes) && filteredCandidates.length > 1;
+    // D0 skip for active module alias: only fires when the alias block above
+    // actually narrowed filteredCandidates. In Python, a local variable can
+    // shadow an imported module name (e.g. `from models.c import C; c = C()`
+    // creates both a module alias `c → models/c.py` AND a typed local `c`).
+    // Checking `aliasNarrowed` rather than `ctx.moduleAliasMap.has(receiverName)`
+    // ensures D0 still runs when the method isn't in the aliased module —
+    // which means the receiver is a typed local variable, not a module reference.
+    if (!hasOverloadConcern && !aliasNarrowed) {
+      const memberResult = resolveMemberCall(
+        call.receiverTypeName,
+        call.calledName,
+        currentFile,
+        ctx,
+        heritageMap,
+        call.argCount,
+      );
+      if (memberResult) return memberResult;
+    }
+
     // D1. Resolve the receiver type
     const typeResolved = ctx.resolve(call.receiverTypeName, currentFile);
     if (typeResolved && typeResolved.candidates.length > 0) {
@@ -1375,8 +1565,13 @@ const resolveCallTarget = (
       // D2. Widen candidates: same-file tier may miss the parent's method when
       //     it lives in another file. Query the symbol table directly for all
       //     global methods with this name, then apply arity/kind filtering.
+      //
+      //     When the candidate set was already narrowed by module-alias
+      //     disambiguation, do NOT widen back to the full fuzzy pool — that
+      //     would undo the alias narrowing and reintroduce homonym candidates
+      //     from other files.
       const methodPool =
-        filteredCandidates.length <= 1
+        filteredCandidates.length <= 1 && !aliasNarrowed
           ? filterCallableCandidates(
               ctx.symbols.lookupFuzzy(call.calledName),
               call.argCount,
@@ -1407,6 +1602,23 @@ const resolveCallTarget = (
         if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
         return null;
       }
+
+      // Zero-match null-route: we committed to receiver narrowing (D1 succeeded)
+      // but both file-based (D3) and owner-based (D4) filters produced zero
+      // matches. The lone candidate in `filteredCandidates` does not belong to
+      // this receiver type — refuse to emit a CALLS edge rather than fall
+      // through to the permissive single-candidate tail return.
+      //
+      // Addresses Codex review finding R3 (PR #744): member calls where
+      // fuzzy fallback picked a globally-matching symbol that has no
+      // relationship to the receiver's class hierarchy were silently
+      // producing false-positive edges. Example: Rust `c.trait_only()` where
+      // `trait_only` is captured as a Function node with no ownerId — it
+      // matches the name but fails both file and owner narrowing, so the
+      // old tail return would pick it incorrectly.
+      if (fileFiltered.length === 0 && ownerFiltered.length === 0) {
+        return null;
+      }
     }
   }
 
@@ -1423,22 +1635,11 @@ const resolveCallTarget = (
   }
 
   if (filteredCandidates.length !== 1) {
-    // Deduplicate: Swift extensions create multiple Class nodes with the same name.
-    // When all candidates share the same type and differ only by file (extension vs
-    // primary definition), they represent the same symbol. Prefer the primary
-    // definition (shortest file path: Product.swift over ProductExtension.swift).
-    if (filteredCandidates.length > 1) {
-      const allSameType = filteredCandidates.every((c) => c.type === filteredCandidates[0].type);
-      if (
-        allSameType &&
-        (filteredCandidates[0].type === 'Class' || filteredCandidates[0].type === 'Struct')
-      ) {
-        const sorted = [...filteredCandidates].sort(
-          (a, b) => a.filePath.length - b.filePath.length,
-        );
-        return toResolveResult(sorted[0], tiered.tier);
-      }
-    }
+    // See `dedupSwiftExtensionCandidates` — returns non-null only when the
+    // Swift-extension same-name collision heuristic applies. Otherwise null-
+    // route (ambiguous candidates should not produce a wrong edge).
+    const deduped = dedupSwiftExtensionCandidates(filteredCandidates, tiered.tier);
+    if (deduped) return deduped;
     return null;
   }
 
@@ -1602,9 +1803,33 @@ const resolveFieldOwnership = (
 
 /**
  * Resolve a method by owner type name using the eagerly-populated methodByOwner index.
- * Returns the SymbolDefinition if an unambiguous method is found, undefined otherwise.
- * Falls through to undefined for: unknown type, no class-like candidates, ambiguous overloads.
- * When heritageMap is provided, falls back to MRO-aware parent chain walking.
+ * Returns `{ def, tier }` when an unambiguous method is found, `undefined` otherwise.
+ *
+ * **Multi-candidate iteration (homonym disambiguation):** when `ctx.resolve(ownerType)`
+ * returns multiple class-like candidates (e.g. two classes named `User` in different
+ * files reachable from the call site), each is probed with `lookupMethodByOwnerWithMRO`.
+ * Results are deduplicated by `nodeId` so that:
+ *
+ *   - homonym classes that both walk up to the SAME ancestor's method collapse to 1 hit
+ *   - aliased re-exports that produce two candidates pointing at the same def collapse too
+ *
+ * After deduplication:
+ *
+ *   - 0 unique matches → `undefined` (owner-scoped path has no answer; D1-D4 fuzzy
+ *     fallback in `resolveCallTarget` may still find something via lookupFuzzy)
+ *   - 1 unique match   → return it
+ *   - ≥2 unique matches → `undefined` (genuine homonym ambiguity; don't silently pick one)
+ *
+ * This absorbs what was previously D4's job inside `resolveCallTarget` — "filter fuzzy
+ * candidates to those whose ownerId is in the receiver type's nodeId set" — into the
+ * owner-scoped path, aligning with the plan's target:
+ *
+ *     `resolveCallTarget` D2 widening → `model.lookupMethodWithMRO(ownerNodeId, name)`
+ *
+ * The returned `tier` reflects how the owner TYPE was resolved (not the method name).
+ * Threaded out here so callers don't need a second `ctx.resolve(ownerType, ...)` call —
+ * this decouples callers from `ctx.resolve`'s per-file caching contract, which SM-16
+ * will restructure when it replaces the `lookupFuzzy` data source.
  */
 const resolveMethodByOwner = (
   receiverTypeName: string,
@@ -1612,31 +1837,386 @@ const resolveMethodByOwner = (
   filePath: string,
   ctx: ResolutionContext,
   heritageMap?: HeritageMap,
-): SymbolDefinition | undefined => {
+  argCount?: number,
+): { def: SymbolDefinition; tier: ResolutionTier } | undefined => {
   const typeResolved = ctx.resolve(receiverTypeName, filePath);
   if (!typeResolved) return undefined;
-  const classDef = typeResolved.candidates.find((d) => CLASS_LIKE_TYPES.has(d.type));
-  if (!classDef) return undefined;
 
-  // When HeritageMap is available, delegate to MRO-aware lookup which performs
-  // the direct owner lookup itself before walking ancestors — avoids a double
-  // direct lookup on the hot path.
-  if (heritageMap) {
-    const language = getLanguageFromFilename(filePath);
-    if (language) {
-      return lookupMethodByOwnerWithMRO(
-        classDef.nodeId,
-        methodName,
-        heritageMap,
-        ctx.symbols,
-        language,
-      );
+  // MRO walking needs a language hint; compute once and reuse for every candidate.
+  // Unknown extension → fall back to plain direct lookup (D1-D4 still runs on miss).
+  const language = heritageMap ? getLanguageFromFilename(filePath) : null;
+  const canWalkMRO = heritageMap != null && language != null;
+
+  // Iterate all class-like candidates tracking the first unambiguous hit.
+  // Zero-allocation fast path: the common case is exactly one class candidate,
+  // so we avoid building a Map. A second hit with a different `nodeId` flips
+  // `ambiguous` and short-circuits the loop. Diamond MRO convergence on the
+  // same inherited method collapses to one hit because `nodeId` matches.
+  //
+  //   firstDef === undefined → owner-scoped resolution found nothing
+  //   firstDef && !ambiguous → unambiguous answer
+  //   ambiguous              → genuine homonym ambiguity — refuse to pick
+  //
+  // argCount is threaded through so arity-differing overloads
+  // (e.g. C++ `greet()` vs `greet(string)`) are disambiguated inside the
+  // owner-scoped lookup rather than collapsing to an arbitrary first pick.
+  let firstDef: SymbolDefinition | undefined;
+  let ambiguous = false;
+  for (const candidate of typeResolved.candidates) {
+    if (!CLASS_LIKE_TYPES.has(candidate.type)) continue;
+    const def = canWalkMRO
+      ? lookupMethodByOwnerWithMRO(
+          candidate.nodeId,
+          methodName,
+          heritageMap,
+          ctx.symbols,
+          language,
+          argCount,
+        )
+      : ctx.symbols.lookupMethodByOwner(candidate.nodeId, methodName, argCount);
+    if (!def) continue;
+    if (!firstDef) {
+      firstDef = def;
+    } else if (def.nodeId !== firstDef.nodeId) {
+      ambiguous = true;
+      break;
     }
   }
 
-  // Fallback when no HeritageMap (or the file extension is unrecognized):
-  // plain direct lookup with no ancestor walk.
-  return ctx.symbols.lookupMethodByOwner(classDef.nodeId, methodName);
+  if (!firstDef || ambiguous) return undefined;
+  return { def: firstDef, tier: typeResolved.tier };
+};
+
+// ---------------------------------------------------------------------------
+// SM-11: Owner-scoped + MRO member-call resolution (no fuzzy lookup)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a member call using owner-scoped + MRO resolution only (no fuzzy lookup).
+ * Used for `obj.method()` calls where the receiver type is known.
+ *
+ * Delegates to {@link resolveMethodByOwner} which performs an O(1) owner-scoped
+ * method lookup and, when a {@link HeritageMap} is provided, walks the MRO chain
+ * via {@link lookupMethodByOwnerWithMRO}.
+ *
+ * {@link resolveCallTarget} delegates here for member calls before falling back
+ * to the more expensive fuzzy-widening path (D1-D4).
+ *
+ * **SEMANTIC CHANGE (2026-04-09):** The confidence tier now reflects how the
+ * owner TYPE was resolved, not how the method NAME was resolved globally. The
+ * previous D0 fast path in `resolveCallTarget` used `tiered.tier` from
+ * `ctx.resolve(calledName, ...)` — a name-based tier that matched what D1-D4
+ * fuzzy widening would produce. The new tier is owner-type-based, which is
+ * more accurate for owner-scoped resolution (the discriminant IS the class,
+ * not the method name). Downstream consumers that filter CALLS edges by
+ * confidence threshold may see shifted values on otherwise-unchanged code.
+ * See the "returns result with correct confidence tier" tests below for the
+ * locked-in behavior.
+ *
+ * **Performance:** Callers that only need the return type (e.g. `walkMixedChain`)
+ * should call {@link resolveMethodByOwner} directly and use the `.def.returnType`
+ * field instead, to avoid building a throwaway `ResolveResult`.
+ *
+ * @param ownerType   - The receiver's type name (e.g. 'User')
+ * @param methodName  - The method being called (e.g. 'save')
+ * @param currentFile - File path of the call site
+ * @param ctx         - Resolution context
+ * @param heritageMap - Optional heritage map for MRO-aware ancestor walking
+ */
+export const resolveMemberCall = (
+  ownerType: string,
+  methodName: string,
+  currentFile: string,
+  ctx: ResolutionContext,
+  heritageMap?: HeritageMap,
+  argCount?: number,
+): ResolveResult | null => {
+  const resolved = resolveMethodByOwner(
+    ownerType,
+    methodName,
+    currentFile,
+    ctx,
+    heritageMap,
+    argCount,
+  );
+  if (!resolved) return null;
+  return toResolveResult(resolved.def, resolved.tier);
+};
+
+// ---------------------------------------------------------------------------
+// SM-13: Free-function call resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a free-function call using `lookupExact` (same-file) + import-scoped
+ * resolution via `ctx.resolve()`.
+ *
+ * Used for `foo()`, `doStuff()` — unqualified calls with no receiver.
+ * Also handles Swift/Kotlin implicit constructors (`User()` without `new`)
+ * by delegating to {@link resolveStaticCall} when the tiered pool contains
+ * class-like targets.
+ *
+ * {@link resolveCallTarget} delegates here for `callForm === 'free'` before
+ * processing constructor and member calls.
+ *
+ * **Design note (SM-13):** This path still falls through to Tier 3 (global)
+ * via `ctx.resolve()`. Fuzzy global resolution remains until Phase 5 replaces
+ * `lookupFuzzy` with a scoped data source.
+ *
+ * **Asymmetry vs `resolveCallTarget`:** `resolveFreeCall` intentionally does
+ * NOT take a `widenCache` parameter and does NOT run a D2 fuzzy-widening
+ * pass. Member calls (`resolveCallTarget`'s main body) widen via
+ * `lookupFuzzy` to reach parent-class methods defined in different files;
+ * free calls have no receiver type and rely exclusively on the tiered pool
+ * from `ctx.resolve()`. Phase 5 will revisit whether free calls need a
+ * scoped widening pass once `lookupFuzzy` is retired.
+ *
+ * @param calledName  - The called function name (e.g. 'doStuff')
+ * @param filePath    - File path of the call site
+ * @param ctx         - Resolution context
+ * @param argCount    - Optional argument count for arity filtering
+ * @param tieredOverride - Pre-computed tiered candidates from an upstream
+ *                       `ctx.resolve` call. When provided, skips the redundant
+ *                       lookup inside this function.
+ * @param overloadHints  - Optional AST-based overload disambiguation hints
+ * @param preComputedArgTypes - Optional pre-computed argument types (worker path)
+ */
+export const resolveFreeCall = (
+  calledName: string,
+  filePath: string,
+  ctx: ResolutionContext,
+  argCount?: number,
+  tieredOverride?: TieredCandidates,
+  overloadHints?: OverloadHints,
+  preComputedArgTypes?: (string | undefined)[],
+): ResolveResult | null => {
+  const tiered = tieredOverride ?? ctx.resolve(calledName, filePath);
+  if (!tiered) return null;
+
+  let filteredCandidates = filterCallableCandidates(tiered.candidates, argCount, 'free');
+
+  // Class-target fast path: Swift/Kotlin `User()` — free-form call targeting a
+  // class. Delegates to resolveStaticCall for O(1) class + constructor lookup.
+  // The `.some()` trigger must stay aligned with `INSTANTIABLE_CLASS_TYPES` —
+  // any type admitted here that is not in that set will cause resolveStaticCall
+  // to return null, wasting two lookup passes per call. `Enum` is deliberately
+  // excluded; `Record` is included so C# records and Kotlin data classes reach
+  // the fast path.
+  // Align with INSTANTIABLE_CLASS_TYPES by reusing the set directly rather
+  // than enumerating literal strings. This converts an invariant that was
+  // previously enforced by a comment ("keep this list aligned with
+  // INSTANTIABLE_CLASS_TYPES") into one enforced structurally — any future
+  // extension of the set (e.g. Kotlin `object`) propagates here automatically.
+  // The `dedupSwiftExtensionCandidates` helper used in the tail of this
+  // function deliberately uses a narrower literal `'Class' | 'Struct'` check
+  // — Swift extensions only produce Class duplicates in practice, so Record
+  // is excluded there by design. Do not collapse that helper into
+  // INSTANTIABLE_CLASS_TYPES.
+  const hasClassTarget =
+    filteredCandidates.length === 0 &&
+    tiered.candidates.some((c) => INSTANTIABLE_CLASS_TYPES.has(c.type));
+  if (hasClassTarget) {
+    const staticResult = resolveStaticCall(calledName, filePath, ctx, argCount, tiered);
+    if (staticResult) return staticResult;
+    // Retry with constructor form: Swift/Kotlin constructor calls look like
+    // free function calls (no `new` keyword). If resolveStaticCall didn't
+    // match, re-filter with constructor form so CONSTRUCTOR_TARGET_TYPES
+    // applies.
+    //
+    // The retry fires for every null return from `resolveStaticCall`, which
+    // can happen for three distinct reasons — all three are handled below:
+    //
+    //   (a) No explicit `Constructor` node found and zero instantiable
+    //       class candidates (e.g. Interface/Trait/Impl only — the SM-12
+    //       null-route contract). `filterCallableCandidates` with
+    //       `'constructor'` form will also return nothing → we fall
+    //       through to the final null return. Correct.
+    //
+    //   (b) Homonym ambiguity — two or more instantiable class candidates
+    //       share the name (e.g. `User` in two files, same tier). The
+    //       retry repopulates `filteredCandidates` with both Classes and
+    //       they flow into `dedupSwiftExtensionCandidates` below, which
+    //       either picks the shortest-path primary or null-routes.
+    //       Covered by the R7 Swift-extension dedup test.
+    //
+    //   (c) `resolveStaticCall` step 4 bailed because the tiered pool
+    //       contains ownerless `Constructor` nodes (some extractors emit
+    //       constructors without `ownerId`). Those `Constructor` nodes
+    //       survive the constructor-form filter below and reach overload
+    //       disambiguation, giving the existing filter path a chance to
+    //       pick the right one. Correct but currently uncovered by a
+    //       dedicated test — the R5 `preComputedArgTypes` path exercises
+    //       overload disambiguation for Functions, which is structurally
+    //       the same code.
+    filteredCandidates = filterCallableCandidates(tiered.candidates, argCount, 'constructor');
+  }
+
+  // E. Overload disambiguation
+  if (filteredCandidates.length > 1) {
+    const disambiguated = overloadHints
+      ? tryOverloadDisambiguation(filteredCandidates, overloadHints)
+      : preComputedArgTypes
+        ? matchCandidatesByArgTypes(filteredCandidates, preComputedArgTypes)
+        : null;
+    if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
+  }
+
+  if (filteredCandidates.length !== 1) {
+    // See `dedupSwiftExtensionCandidates` — shared helper, single source of
+    // truth for the Swift-extension same-name collision heuristic.
+    const deduped = dedupSwiftExtensionCandidates(filteredCandidates, tiered.tier);
+    if (deduped) return deduped;
+    return null;
+  }
+
+  return toResolveResult(filteredCandidates[0], tiered.tier);
+};
+
+// ---------------------------------------------------------------------------
+// SM-12: Constructor/static call resolution (no fuzzy lookup)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a constructor or static call using class-scoped lookup (no fuzzy lookup).
+ * Used for `new User()` / `User()` calls where the calledName targets a class.
+ *
+ * Uses {@link SymbolTable.lookupClassByName} for O(1) class lookup and
+ * {@link SymbolTable.lookupMethodByOwner} for constructor resolution.
+ * {@link resolveCallTarget} delegates here for constructor and free-form calls
+ * that target a class, before falling back to the more expensive fuzzy-widening
+ * path (D1-D4).
+ *
+ * Resolution strategy:
+ *   1. `lookupClassByName(className)` — O(1) pre-check; bail early if no class exists.
+ *   2. `ctx.resolve(className, currentFile)` — import-scoped tier for confidence.
+ *   3. Filter to class-like candidates via `CLASS_LIKE_TYPES` and walk each
+ *      with `lookupMethodByOwner(classNodeId, className, argCount)` — O(1)
+ *      constructor lookup. Only accept results with `type === 'Constructor'`.
+ *   4. If step 3 found nothing and the tiered pool contains ownerless
+ *      `Constructor` nodes (common in some extractors), bail out so
+ *      `filterCallableCandidates` downstream handles Constructor-vs-Class
+ *      preference correctly.
+ *   5. Class-node fallback: filter `classCandidates` through
+ *      `INSTANTIABLE_CLASS_TYPES` and return the sole survivor when there is
+ *      exactly one. Null-route on zero survivors (Interface / Trait / Impl
+ *      stripped) or multiple (homonym ambiguity).
+ *
+ * @param className   - The class name (e.g. 'User'). Also used as the method
+ *                       name for the `lookupMethodByOwner` scan, because the
+ *                       only constructor-shaped call we handle today is
+ *                       `ClassName(...)` / `new ClassName(...)`. Named
+ *                       constructors like Dart `User.fromJson()` arrive as
+ *                       member calls and route through `resolveMemberCall`,
+ *                       so this function does not yet need a separate
+ *                       `methodName` parameter. Revisit if a language surfaces
+ *                       a static-method-shaped call with a distinct member
+ *                       name.
+ * @param currentFile - File path of the call site
+ * @param ctx         - Resolution context
+ * @param argCount    - Optional argument count for arity filtering
+ * @param tieredOverride - Pre-computed tiered candidates for `className` from
+ *                       an upstream `ctx.resolve` call. When provided, skips
+ *                       the redundant lookup inside this function. Leave
+ *                       unset for direct callers without a prior resolution.
+ */
+export const resolveStaticCall = (
+  className: string,
+  currentFile: string,
+  ctx: ResolutionContext,
+  argCount?: number,
+  tieredOverride?: TieredCandidates,
+): ResolveResult | null => {
+  // 1. Pre-check: does a class with this name exist at all? (O(1))
+  //    This guards against the expensive `ctx.resolve` walk when the name
+  //    is clearly not class-like (e.g. plain functions). When `tieredOverride`
+  //    is supplied, the caller has already paid for the tiered lookup, so this
+  //    pre-check still prevents the class-candidate filter + lookupMethodByOwner
+  //    loop from running on obviously non-class targets.
+  const allClasses = ctx.symbols.lookupClassByName(className);
+  if (allClasses.length === 0) return null;
+
+  // 2. Scope via ctx.resolve for import-tier information. Reuse the caller's
+  //    tiered result when provided — it is computed from the same name and
+  //    file context, so re-running the walk would be a pure waste.
+  const typeResolved = tieredOverride ?? ctx.resolve(className, currentFile);
+  if (!typeResolved) return null;
+
+  const classCandidates = typeResolved.candidates.filter((c) => CLASS_LIKE_TYPES.has(c.type));
+  if (classCandidates.length === 0) return null;
+
+  // 3. Try lookupMethodByOwner for explicit Constructor nodes.
+  //    Only accept results with type === 'Constructor' — a Method or Function
+  //    that happens to share the class name (e.g. C++ methods named after
+  //    their class) is not a constructor for resolution purposes.
+  //    Same dedup logic as resolveMethodByOwner: diamond inheritance converging
+  //    on the same constructor collapses to one hit.
+  //
+  //    Same-name assumption: the lookup key is `${candidate.nodeId}\0${className}`,
+  //    so this finds Constructor nodes whose symbol name equals the class name
+  //    (`class User` with a `Constructor` named `User`). Constructors indexed
+  //    under a different name (e.g. Python `__init__`) will not be found here —
+  //    but they also won't appear in the tiered pool for `ctx.resolve(className)`
+  //    for the same reason, so step 4's Constructor-presence check will not
+  //    see them either. The two miss cases are symmetric. If a future extractor
+  //    indexes Constructor nodes under an alternative name while still setting
+  //    `ownerId`, this assumption will need revisiting.
+  let firstDef: SymbolDefinition | undefined;
+  let ambiguous = false;
+  for (const candidate of classCandidates) {
+    const def = ctx.symbols.lookupMethodByOwner(candidate.nodeId, className, argCount);
+    if (!def || def.type !== 'Constructor') continue;
+    if (!firstDef) {
+      firstDef = def;
+    } else if (def.nodeId !== firstDef.nodeId) {
+      ambiguous = true;
+      break;
+    }
+  }
+
+  if (firstDef && !ambiguous) {
+    return toResolveResult(firstDef, typeResolved.tier);
+  }
+
+  // 4. lookupMethodByOwner found nothing — check whether the tiered pool
+  //    contains Constructor nodes that lack ownerId (common in some extractors).
+  //    If so, bail out so the existing filterCallableCandidates path handles
+  //    Constructor-vs-Class preference correctly.
+  //
+  //    This branch also catches the step-3 ambiguous case (`ambiguous = true`
+  //    with two distinct Constructor nodes across multiple class candidates):
+  //    the same Constructor nodes are indexed under the class name in the
+  //    tiered pool, so `.some(Constructor)` is true here and we defer to
+  //    `filterCallableCandidates` downstream rather than guess which overload
+  //    to pick. Do not remove this check without also handling the ambiguous
+  //    step-3 path explicitly.
+  if (typeResolved.candidates.some((c) => c.type === 'Constructor')) {
+    return null;
+  }
+
+  // 5. No constructor nodes at all — fall back to the class node itself, but
+  //    ONLY when it is actually instantiable. Interface / Trait / Impl / Enum
+  //    are deliberately excluded via `INSTANTIABLE_CLASS_TYPES` to prevent
+  //    false `CALLS` edges from constructor-shaped calls to non-instantiable
+  //    nodes. This also disambiguates the Rust same-file shadowing case
+  //    (`struct User` + `impl User` both present at same-file tier): the
+  //    Impl is stripped, leaving the Struct as the sole instantiable target.
+  //    Addresses Codex review finding on PR #754.
+  const instantiableCandidates = classCandidates.filter((c) =>
+    INSTANTIABLE_CLASS_TYPES.has(c.type),
+  );
+  // Three outcomes below, in order of likelihood after the fix:
+  //   length === 0 → all candidates were stripped as non-instantiable (e.g.
+  //     Interface / Trait / Impl). Null-route via the fall-through `return
+  //     null` — this is the dominant Codex-fix case.
+  //   length === 1 → a single instantiable candidate remains, return it.
+  //   length  >  1 → two or more instantiable classes share the name (e.g.
+  //     homonym classes across files with no import narrowing). Fall through
+  //     to `return null` so the caller null-routes rather than guess.
+  if (instantiableCandidates.length === 1) {
+    return toResolveResult(instantiableCandidates[0], typeResolved.tier);
+  }
+
+  return null;
 };
 
 // ---------------------------------------------------------------------------
@@ -1729,9 +2309,12 @@ export const lookupMethodByOwnerWithMRO = (
   heritageMap: HeritageMap,
   symbols: SymbolTable,
   language: SupportedLanguages,
+  argCount?: number,
 ): SymbolDefinition | undefined => {
-  // Direct lookup first (child override — no walk needed)
-  const direct = symbols.lookupMethodByOwner(ownerNodeId, methodName);
+  // Direct lookup first (child override — no walk needed).
+  // argCount is threaded through so arity-differing overloads on the direct
+  // owner can be disambiguated before the MRO walk starts.
+  const direct = symbols.lookupMethodByOwner(ownerNodeId, methodName, argCount);
   if (direct) return direct;
 
   const strategy = getProvider(language).mroStrategy;
@@ -1758,9 +2341,10 @@ export const lookupMethodByOwnerWithMRO = (
     ancestors = heritageMap.getAncestors(ownerNodeId);
   }
 
-  // Walk ancestors in MRO order — first match wins
+  // Walk ancestors in MRO order — first match wins.
+  // argCount narrows overloaded ancestors the same way as the direct lookup.
   for (const ancestorId of ancestors) {
-    const method = symbols.lookupMethodByOwner(ancestorId, methodName);
+    const method = symbols.lookupMethodByOwner(ancestorId, methodName, argCount);
     if (method) return method;
   }
 
@@ -1829,12 +2413,16 @@ const walkMixedChain = (
         continue;
       }
       // Fast path: O(1) owner-scoped method lookup via methodByOwner index.
-      // Avoids fuzzy lookup when the owner type is known and the method is unambiguous.
       // Note: CALLS edges for intermediate chain steps are NOT emitted here — walkMixedChain
       // only threads types. CALLS edges come from the outer per-call-expression loop in processCalls.
-      const methodDef = resolveMethodByOwner(currentType, step.name, filePath, ctx, heritageMap);
-      if (methodDef?.returnType) {
-        const fastRetType = extractReturnTypeName(methodDef.returnType);
+      //
+      // We call `resolveMethodByOwner` directly (NOT `resolveMemberCall`) because this is
+      // a hot path — called per chain step per call expression — and we only need the
+      // return type string. Going through `resolveMemberCall` would allocate a throwaway
+      // `ResolveResult` with confidence/reason that we immediately discard.
+      const owned = resolveMethodByOwner(currentType, step.name, filePath, ctx, heritageMap);
+      if (owned?.def.returnType) {
+        const fastRetType = extractReturnTypeName(owned.def.returnType);
         if (fastRetType) {
           currentType = fastRetType;
           continue;
@@ -1845,6 +2433,10 @@ const walkMixedChain = (
         { calledName: step.name, callForm: 'member', receiverTypeName: currentType },
         filePath,
         ctx,
+        undefined,
+        undefined,
+        undefined,
+        heritageMap,
       );
       if (!resolved) {
         // Stdlib passthrough: unwrap(), clone(), etc. preserve the receiver type
@@ -1994,6 +2586,7 @@ export const processCallsFromExtracted = async (
         undefined,
         widenCache,
         effectiveCall.argTypes,
+        heritageMap,
       );
       if (!resolved) {
         // Vue template component fallback: match calledName against imported .vue basenames

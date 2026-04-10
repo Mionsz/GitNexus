@@ -572,6 +572,14 @@ const verifyConstructorBindings = (
       // namedImportMap tells us which source file exported the callee so we
       // can look up its file-scope binding via the O(1) fileScopeGet method.
       //
+      // Tier gating: only fall back to the accumulator when resolution is
+      // unambiguously import-scoped or global. When tiered.tier is 'same-file',
+      // the local definition is authoritative even without a return type
+      // annotation — using the accumulator here would let an imported callee
+      // with the same name shadow the local one, producing false CALLS edges.
+      // When multiple callable candidates exist, the accumulator would pick
+      // arbitrarily — skip to avoid fabricated edges.
+      //
       // Quality note: worker-path accumulator entries are Tier 0/1 only
       // (annotation-declared + same-file constructor inference) — see the
       // BindingAccumulator class JSDoc. For large repos where the worker
@@ -587,7 +595,9 @@ const verifyConstructorBindings = (
       //      — TypeEnv + graph isExported flag
       //   3. This fallback — namedImportMap + BindingAccumulator
       // A future cleanup should merge these into a single resolution pass.
-      if (!typeName && bindingAccumulator) {
+      const shouldFallback =
+        tiered?.tier !== 'same-file' && (!callableDefs || callableDefs.length <= 1);
+      if (!typeName && bindingAccumulator && shouldFallback) {
         const namedImports = ctx.namedImportMap.get(filePath);
         const importBinding = namedImports?.get(calleeName);
         if (importBinding) {
@@ -690,117 +700,262 @@ export const processCalls = async (
   const logSkipped = isVerboseIngestionEnabled();
   const skippedByLang = logSkipped ? new Map<string, number>() : null;
 
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
+  // ── Two-pass split for accumulator ordering correctness ──
+  // When bindingAccumulator is present, the Phase 9 fallback in
+  // verifyConstructorBindings reads from the accumulator. If we flush and
+  // verify in the same per-file iteration, consumer files processed before
+  // their provider files won't see the provider's bindings — causing silent
+  // misses. Fix: pre-pass flushes ALL files' TypeEnv bindings into the
+  // accumulator before the main loop runs verifyConstructorBindings.
+  // This mirrors the worker path where all appendFile calls complete before
+  // processCallsFromExtracted runs. For the sequential path (<15 files),
+  // buffering per-file state is negligible.
+  //
+  // When bindingAccumulator is absent (legacy/Phase 14 path), the existing
+  // single-pass behavior is preserved — no pre-pass, no buffering.
+  interface PrePassState {
+    file: { path: string; content: string };
+    language: SupportedLanguages;
+    provider: ReturnType<typeof getProvider>;
+    tree: ReturnType<typeof parser.parse>;
+    matches: ReturnType<Parser.Query['matches']>;
+    parentMap: ReadonlyMap<string, readonly string[]>;
+    typeEnv: ReturnType<typeof buildTypeEnv>;
+  }
+  const prePassStates: PrePassState[] | undefined = bindingAccumulator ? [] : undefined;
+
+  if (bindingAccumulator) {
+    // ── Pre-pass: build TypeEnv, flush to accumulator, buffer state ──
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      if (i % 20 === 0) await yieldToEventLoop();
+
+      const language = getLanguageFromFilename(file.path);
+      if (!language) continue;
+      if (!isLanguageAvailable(language)) {
+        if (skippedByLang) {
+          skippedByLang.set(language, (skippedByLang.get(language) ?? 0) + 1);
+        }
+        continue;
+      }
+
+      const provider = getProvider(language);
+      const queryStr = provider.treeSitterQueries;
+      if (!queryStr) continue;
+
+      await loadLanguage(language, file.path);
+
+      let tree = astCache.get(file.path);
+      if (!tree) {
+        try {
+          tree = parser.parse(file.content, undefined, {
+            bufferSize: getTreeSitterBufferSize(file.content.length),
+          });
+        } catch (parseError) {
+          continue;
+        }
+        astCache.set(file.path, tree);
+      }
+
+      let matches;
+      try {
+        const lang = parser.getLanguage();
+        const query = new Parser.Query(lang, queryStr);
+        matches = query.matches(tree.rootNode);
+      } catch (queryError) {
+        console.warn(`Query error for ${file.path}:`, queryError);
+        continue;
+      }
+
+      // Extract heritage for parentMap (same as main loop)
+      const fileParentMap = new Map<string, string[]>();
+      for (const match of matches) {
+        const captureMap: Record<string, any> = {};
+        match.captures.forEach((c) => (captureMap[c.name] = c.node));
+        if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
+          const className: string = captureMap['heritage.class'].text;
+          const parentName: string = captureMap['heritage.extends'].text;
+          const extendsNode = captureMap['heritage.extends'];
+          const fieldDecl = extendsNode.parent;
+          if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name'))
+            continue;
+          let parents = fileParentMap.get(className);
+          if (!parents) {
+            parents = [];
+            fileParentMap.set(className, parents);
+          }
+          if (!parents.includes(parentName)) parents.push(parentName);
+        }
+      }
+      const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
+      for (const [cls, parents] of fileParentMap) {
+        let global = globalParentMap.get(cls);
+        let seen = globalParentSeen.get(cls);
+        if (!global) {
+          global = [];
+          globalParentMap.set(cls, global);
+        }
+        if (!seen) {
+          seen = new Set();
+          globalParentSeen.set(cls, seen);
+        }
+        for (const p of parents) {
+          if (!seen.has(p)) {
+            seen.add(p);
+            global.push(p);
+          }
+        }
+      }
+
+      const importedBindings = importedBindingsMap?.get(file.path);
+      const importedReturnTypes = importedReturnTypesMap?.get(file.path);
+      const importedRawReturnTypes = importedRawReturnTypesMap?.get(file.path);
+      const typeEnv = buildTypeEnv(tree, language, {
+        symbolTable: ctx.symbols,
+        parentMap,
+        importedBindings,
+        importedReturnTypes,
+        importedRawReturnTypes,
+        enclosingFunctionFinder: provider?.enclosingFunctionFinder,
+        extractFunctionName: provider?.methodExtractor?.extractFunctionName,
+      });
+      if (typeEnv && exportedTypeMap) {
+        const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
+        if (fileExports) exportedTypeMap.set(file.path, fileExports);
+      }
+      typeEnv.flush(file.path, bindingAccumulator);
+
+      prePassStates!.push({ file, language, provider, tree, matches, parentMap, typeEnv });
+    }
+  }
+
+  // ── Main loop: resolve calls (and optionally build TypeEnv if no pre-pass) ──
+  const loopSource = prePassStates ?? files;
+  for (let i = 0; i < loopSource.length; i++) {
+    const isPrePassed = prePassStates !== undefined;
+    const entry = loopSource[i];
+    const file = isPrePassed
+      ? (entry as PrePassState).file
+      : (entry as { path: string; content: string });
+
     enclosingFnExtractCache.clear();
     onProgress?.(i + 1, files.length);
     if (i % 20 === 0) await yieldToEventLoop();
 
-    const language = getLanguageFromFilename(file.path);
-    if (!language) continue;
-    if (!isLanguageAvailable(language)) {
-      if (skippedByLang) {
-        skippedByLang.set(language, (skippedByLang.get(language) ?? 0) + 1);
-      }
-      continue;
-    }
+    let language: SupportedLanguages;
+    let provider: ReturnType<typeof getProvider>;
+    let tree: ReturnType<typeof parser.parse>;
+    let matches: ReturnType<Parser.Query['matches']>;
+    let typeEnv: ReturnType<typeof buildTypeEnv>;
+    let parentMap: ReadonlyMap<string, readonly string[]>;
 
-    const provider = getProvider(language);
-    const queryStr = provider.treeSitterQueries;
-    if (!queryStr) continue;
-
-    await loadLanguage(language, file.path);
-
-    let tree = astCache.get(file.path);
-    if (!tree) {
-      try {
-        tree = parser.parse(file.content, undefined, {
-          bufferSize: getTreeSitterBufferSize(file.content.length),
-        });
-      } catch (parseError) {
+    if (isPrePassed) {
+      // Reuse state from pre-pass — TypeEnv and flush already done
+      const state = entry as PrePassState;
+      language = state.language;
+      provider = state.provider;
+      tree = state.tree;
+      matches = state.matches;
+      typeEnv = state.typeEnv;
+      parentMap = state.parentMap;
+    } else {
+      // Legacy single-pass path (no bindingAccumulator)
+      const lang = getLanguageFromFilename(file.path);
+      if (!lang) continue;
+      if (!isLanguageAvailable(lang)) {
+        if (skippedByLang) {
+          skippedByLang.set(lang, (skippedByLang.get(lang) ?? 0) + 1);
+        }
         continue;
       }
-      astCache.set(file.path, tree);
-    }
+      language = lang;
 
-    let query;
-    let matches;
-    try {
-      const language = parser.getLanguage();
-      query = new Parser.Query(language, queryStr);
-      matches = query.matches(tree.rootNode);
-    } catch (queryError) {
-      console.warn(`Query error for ${file.path}:`, queryError);
-      continue;
-    }
+      provider = getProvider(language);
+      const queryStr = provider.treeSitterQueries;
+      if (!queryStr) continue;
 
-    // Pre-pass: extract heritage from query matches to build parentMap for buildTypeEnv.
-    // Heritage-processor runs in PARALLEL, so graph edges don't exist when buildTypeEnv runs.
-    const fileParentMap = new Map<string, string[]>();
-    for (const match of matches) {
-      const captureMap: Record<string, any> = {};
-      match.captures.forEach((c) => (captureMap[c.name] = c.node));
-      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
-        const className: string = captureMap['heritage.class'].text;
-        const parentName: string = captureMap['heritage.extends'].text;
-        const extendsNode = captureMap['heritage.extends'];
-        const fieldDecl = extendsNode.parent;
-        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name'))
+      await loadLanguage(language, file.path);
+
+      tree = astCache.get(file.path)!;
+      if (!tree) {
+        try {
+          tree = parser.parse(file.content, undefined, {
+            bufferSize: getTreeSitterBufferSize(file.content.length),
+          });
+        } catch (parseError) {
           continue;
-        let parents = fileParentMap.get(className);
-        if (!parents) {
-          parents = [];
-          fileParentMap.set(className, parents);
         }
-        if (!parents.includes(parentName)) parents.push(parentName);
+        astCache.set(file.path, tree);
       }
-    }
-    const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
-    // Merge per-file heritage into globalParentMap for cross-file isSubclassOf lookups.
-    // Uses a parallel Set (globalParentSeen) for O(1) deduplication instead of O(n) includes().
-    for (const [cls, parents] of fileParentMap) {
-      let global = globalParentMap.get(cls);
-      let seen = globalParentSeen.get(cls);
-      if (!global) {
-        global = [];
-        globalParentMap.set(cls, global);
+
+      try {
+        const parseLang = parser.getLanguage();
+        const query = new Parser.Query(parseLang, queryStr);
+        matches = query.matches(tree.rootNode);
+      } catch (queryError) {
+        console.warn(`Query error for ${file.path}:`, queryError);
+        continue;
       }
-      if (!seen) {
-        seen = new Set();
-        globalParentSeen.set(cls, seen);
-      }
-      for (const p of parents) {
-        if (!seen.has(p)) {
-          seen.add(p);
-          global.push(p);
+
+      // Heritage extraction (same as pre-pass, only runs in legacy path)
+      const fileParentMap = new Map<string, string[]>();
+      for (const match of matches) {
+        const captureMap: Record<string, any> = {};
+        match.captures.forEach((c) => (captureMap[c.name] = c.node));
+        if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
+          const className: string = captureMap['heritage.class'].text;
+          const parentName: string = captureMap['heritage.extends'].text;
+          const extendsNode = captureMap['heritage.extends'];
+          const fieldDecl = extendsNode.parent;
+          if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name'))
+            continue;
+          let parents = fileParentMap.get(className);
+          if (!parents) {
+            parents = [];
+            fileParentMap.set(className, parents);
+          }
+          if (!parents.includes(parentName)) parents.push(parentName);
         }
+      }
+      for (const [cls, parents] of fileParentMap) {
+        let global = globalParentMap.get(cls);
+        let seen = globalParentSeen.get(cls);
+        if (!global) {
+          global = [];
+          globalParentMap.set(cls, global);
+        }
+        if (!seen) {
+          seen = new Set();
+          globalParentSeen.set(cls, seen);
+        }
+        for (const p of parents) {
+          if (!seen.has(p)) {
+            seen.add(p);
+            global.push(p);
+          }
+        }
+      }
+
+      parentMap = fileParentMap;
+
+      const importedBindings = importedBindingsMap?.get(file.path);
+      const importedReturnTypes = importedReturnTypesMap?.get(file.path);
+      const importedRawReturnTypes = importedRawReturnTypesMap?.get(file.path);
+      typeEnv = buildTypeEnv(tree, language, {
+        symbolTable: ctx.symbols,
+        parentMap,
+        importedBindings,
+        importedReturnTypes,
+        importedRawReturnTypes,
+        enclosingFunctionFinder: provider?.enclosingFunctionFinder,
+        extractFunctionName: provider?.methodExtractor?.extractFunctionName,
+      });
+      if (typeEnv && exportedTypeMap) {
+        const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
+        if (fileExports) exportedTypeMap.set(file.path, fileExports);
       }
     }
 
-    const importedBindings = importedBindingsMap?.get(file.path);
-    const importedReturnTypes = importedReturnTypesMap?.get(file.path);
-    const importedRawReturnTypes = importedRawReturnTypesMap?.get(file.path);
-    const typeEnv = buildTypeEnv(tree, language, {
-      symbolTable: ctx.symbols,
-      parentMap,
-      importedBindings,
-      importedReturnTypes,
-      importedRawReturnTypes,
-      enclosingFunctionFinder: provider?.enclosingFunctionFinder,
-      extractFunctionName: provider?.methodExtractor?.extractFunctionName,
-    });
-    if (typeEnv && exportedTypeMap) {
-      const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
-      if (fileExports) exportedTypeMap.set(file.path, fileExports);
-    }
-    // Flush file-scope bindings into the accumulator. `flush()` is narrowed
-    // to iterate only FILE_SCOPE entries (type-env.ts) — function-scope
-    // bindings are dropped at the flush boundary until a Phase 9 consumer
-    // lands. See type-env.ts::flush() JSDoc for the dual-site reversion
-    // checklist (this sequential path + the worker path in parse-worker.ts).
-    if (bindingAccumulator) {
-      typeEnv.flush(file.path, bindingAccumulator);
-    }
     const callRouter = provider.callRouter;
 
     const verifiedReceivers =

@@ -517,3 +517,274 @@ describe('Phase 9 — Cross-File Call-Result Binding: Ruby', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Note: shadowed import tier gating is tested at the unit level
+// (call-processor.test.ts "Phase 9 tier gating" tests) because the scenario
+// requires invalid TypeScript (same name imported and locally defined).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Regression: consumer file processed before provider in sequential path
+// a-consumer.ts (alphabetically first) imports getUser from b-provider.ts.
+// Without the two-pass flush fix, the accumulator wouldn't have b-provider's
+// bindings when a-consumer's verifyConstructorBindings runs.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Consumer-before-provider regression tests (sequential ordering fix)
+//
+// Each language fixture has a consumer file that sorts alphabetically before
+// the provider file. In the sequential path, the consumer is processed first.
+// The two-pass flush ensures the accumulator has provider bindings before
+// verifyConstructorBindings runs for the consumer.
+// ---------------------------------------------------------------------------
+
+describe('Consumer-Before-Provider: TypeScript', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'ts-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and save method from provider', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+  });
+
+  it('resolves x.save() to User#save despite consumer sorted before provider', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(
+      (c) => c.target === 'save' && c.source === 'main' && c.targetFilePath.includes('b-provider'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: JavaScript', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'js-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+  });
+
+  it('resolves u.save() in main() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(
+      (c) => c.target === 'save' && c.source === 'main' && c.targetFilePath.includes('b-provider'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: Python', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'py-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and save function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    // Python tree-sitter captures all function_definitions as Function, including methods
+    expect(getNodesByLabel(result, 'Function')).toContain('save');
+  });
+
+  it('resolves u.save() in main() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find(
+      (c) => c.target === 'save' && c.source === 'main' && c.targetFilePath.includes('b_provider'),
+    );
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: Java', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'java-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+  });
+
+  it('resolves user.save() in run() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'save' && c.source === 'run');
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: Go', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'go-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User struct and Save method', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('Save');
+  });
+
+  it('resolves user.Save() in main() to User#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'Save' && c.source === 'main');
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: C++', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'cpp-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+  });
+
+  it('resolves user.save() in process() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'save' && c.source === 'process');
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: C#', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'csharp-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and Save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('Save');
+  });
+
+  it('resolves u.Save() in Run() to User#Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'Save' && c.source === 'Run');
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: Kotlin', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'kotlin-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+  });
+
+  it('resolves u.save() in run() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'save' && c.source === 'run');
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: PHP', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'php-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+  });
+
+  it('resolves $u->save() in run() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'save' && c.source === 'run');
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: Ruby', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'rb-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User class and save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+  });
+
+  it('resolves user.save in process() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'save' && c.source === 'process');
+    expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Consumer-Before-Provider: Rust', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(CROSS_FILE_FIXTURES, 'rs-consumer-before-provider'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User struct and save function', () => {
+    expect(getNodesByLabel(result, 'Struct')).toContain('User');
+    // Rust tree-sitter captures impl fns as Function nodes
+    expect(getNodesByLabel(result, 'Function')).toContain('save');
+  });
+
+  it('resolves u.save() in process() to User#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'save' && c.source === 'process');
+    expect(saveCall).toBeDefined();
+  });
+});

@@ -1455,13 +1455,19 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               const rows = await executeQuery('MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId');
               if (rows && rows.length > 0) {
                 skipNodeIds = new Set(rows.map((r: any) => r.nodeId ?? r[0]).filter(Boolean));
+                console.log(
+                  `[embed] ${skipNodeIds.size} nodes already embedded — skipping in incremental run`,
+                );
               }
             } catch (err: any) {
-              // Swallow only "table does not exist" — let real connection errors propagate
-              if (
-                !err?.message?.includes('does not exist') &&
-                !err?.message?.includes('not found')
-              ) {
+              // Swallow only "table does not exist" — let real connection errors propagate.
+              // Log so ops can see this path fire if Kuzu ever changes error wording.
+              const msg = err?.message ?? '';
+              if (msg.includes('does not exist') || msg.includes('not found')) {
+                console.log(
+                  `[embed] CodeEmbedding table not yet present — full embedding run (${msg})`,
+                );
+              } else {
                 throw err;
               }
             }
@@ -1487,7 +1493,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                   },
                 });
               },
-              {},
+              {}, // config: use defaults (runEmbeddingPipeline signature: executeQuery, executeWithReusedStatement, onProgress, config, skipNodeIds)
               skipNodeIds,
             );
           });

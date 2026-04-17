@@ -223,8 +223,8 @@ export const processHeritage = async (
     let query;
     let matches;
     try {
-      const language = parser.getLanguage();
-      query = new Parser.Query(language, queryStr);
+      const treeSitterLang = parser.getLanguage();
+      query = new Parser.Query(treeSitterLang, queryStr);
       matches = query.matches(tree.rootNode);
     } catch (queryError) {
       console.warn(`Heritage query error for ${file.path}:`, queryError);

@@ -278,33 +278,24 @@ const buildParentMapFromHeritage = (
 // ---------------------------------------------------------------------------
 
 /**
- * Look up a method on an owner class, walking the parent chain via HeritageMap
- * when the method isn't found on the direct owner.
+ * DAG stage 5 helper: look up a method on an owner class via MRO walk.
  *
- * Respects the 5 per-language MRO strategies:
- * - `first-wins`:       BFS ancestor walk, first match wins (default)
- * - `leftmost-base`:    BFS ancestor walk, leftmost base in declaration order wins (C++);
- *                        HeritageMap preserves insertion order matching source declaration,
- *                        so BFS order is equivalent to leftmost-base semantics
- * - `c3`:               C3-linearized ancestor order, first match wins (Python)
- * - `implements-split`: BFS ancestor walk, first match wins (Java/C#) —
- *                        full ambiguity detection for multiple interface defaults
- *                        is handled by computeMRO at graph level
- * - `qualified-syntax`: No auto-resolution (Rust) — returns undefined
+ * Low-level resolver; no dependency on SymbolTable, language registry, or
+ * resolution-context (keeps model/ layer free of cross-layer imports).
+ * All strategies respect `argCount` for overload narrowing.
+ * `ancestryOverride` replaces the default walk; caller must compute it correctly.
  *
- * Uses the `c3Linearize` defined in this file (also consumed by
- * mro-processor.ts for graph-level MRO emission) for the `c3` strategy.
+ * Strategy summary (full docs in gitnexus-shared/mro-strategy.ts):
+ * - `first-wins` / `leftmost-base` / `implements-split`: BFS, first match wins.
+ * - `c3`: C3-linearized order; falls back to BFS on cycle/inconsistency.
+ * - `qualified-syntax`: returns undefined immediately (Rust requires explicit syntax).
+ * - `ruby-mixin`: kind-aware walk — see inline comments below.
  *
- * Depends only on {@link SemanticModel} + {@link HeritageMap} + an
- * {@link MroStrategy} literal — NO dependency on SymbolTable, the language
- * registry, or resolution-context, which keeps the `model/` module free of
- * cross-layer imports. Callers derive the strategy from their language
- * provider before invoking this function.
+ * Internal API: exported for call-processor resolvers and tests.
+ * External callers should use resolveMemberCall instead.
  *
- * @internal This is the low-level MRO walker. Exported so call-processor's
- * higher-level resolvers (and unit tests) can invoke it directly. Callers
- * outside `core/ingestion/` should use the higher-level resolvers in
- * call-processor.ts instead of depending on this function.
+ * @see gitnexus-shared/mro-strategy.ts § 'ruby-mixin'
+ * @see call-processor.ts § resolveMemberCall
  */
 export const lookupMethodByOwnerWithMRO = (
   ownerNodeId: string,
@@ -320,27 +311,20 @@ export const lookupMethodByOwnerWithMRO = (
    * node-id array so this walker resolves against `extend` providers only.
    *
    * For `ruby-mixin` strategy, passing an override switches the walker into
-   * a no-prepend-no-self linear scan (the caller has already decided the
+   * a no-prepend-no-direct linear scan (the caller has already decided the
    * order), which is the correct semantics for singleton dispatch.
    */
   ancestryOverride?: readonly string[],
 ): SymbolDefinition | undefined => {
   // ── Ruby mixin strategy ───────────────────────────────────────────
-  //
-  // Kind-aware walk that does NOT short-circuit on the direct owner first.
-  // Ruby MRO for instance dispatch:
-  //   1. Walk `prepend` providers (reverse declaration — last-prepended first)
-  //   2. Direct owner lookup (the class's own methods)
-  //   3. Walk `extends` and `include` providers (reverse declaration)
-  //
-  // For singleton dispatch (`ClassName.foo`), the caller passes
-  // `ancestryOverride = heritageMap.getSingletonAncestry(owner).map(...)`.
-  // The walker then does a simple left-to-right scan of that override and
-  // skips the prepend/direct/extends-include partition.
+  // Kind-aware walk — does NOT short-circuit on direct owner first (prepend beats direct).
+  // Instance dispatch: prepend (reverse) → direct → include (reverse) → transitive BFS.
+  // Singleton dispatch: caller supplies ancestryOverride (extend providers only);
+  //   simple left-to-right scan. Miss NEVER falls through to file-scoped fallback.
+  // See gitnexus-shared/mro-strategy.ts § 'ruby-mixin' for full strategy docs.
   if (strategy === 'ruby-mixin') {
     if (ancestryOverride) {
-      // Singleton dispatch: scan the pre-computed ancestry only.
-      // argCount still narrows overloaded methods.
+      // Singleton dispatch: scan pre-computed ancestry only. Miss null-routes.
       for (const ancestorId of ancestryOverride) {
         const method = model.methods.lookupMethodByOwner(ancestorId, methodName, argCount);
         if (method) return method;
@@ -348,7 +332,7 @@ export const lookupMethodByOwnerWithMRO = (
       return undefined;
     }
 
-    // Instance dispatch — kind-aware walk.
+    // Instance dispatch — kind-aware walk per the pseudocode above.
     const instanceEntries = heritageMap.getInstanceAncestry(ownerNodeId);
     // Partition into prepend parents vs other parents (extends / include /
     // implements / trait-impl), preserving declaration order within each.
@@ -359,27 +343,28 @@ export const lookupMethodByOwnerWithMRO = (
       else otherParents.push(e.parentId);
     }
 
-    // 1. Walk prepend parents in REVERSE declaration order (last-prepended wins).
+    // Step 1: Walk prepend parents in REVERSE declaration order (last-prepended wins).
     for (let i = prependParents.length - 1; i >= 0; i--) {
       const method = model.methods.lookupMethodByOwner(prependParents[i], methodName, argCount);
       if (method) return method;
     }
 
-    // 2. Direct owner lookup (the class's own method).
+    // Step 2: Direct owner lookup (the class's own method).
+    // This is the only difference from other strategies — prepend beats direct.
     const direct = model.methods.lookupMethodByOwner(ownerNodeId, methodName, argCount);
     if (direct) return direct;
 
-    // 3. Walk extends + include parents in REVERSE declaration order.
-    //    (Ruby `include A; include B` puts B ahead of A in MRO.)
+    // Step 3: Walk extends + include parents in REVERSE declaration order.
+    // (Ruby `include A; include B` puts B ahead of A in MRO.)
     for (let i = otherParents.length - 1; i >= 0; i--) {
       const method = model.methods.lookupMethodByOwner(otherParents[i], methodName, argCount);
       if (method) return method;
     }
 
-    // 4. Transitive ancestors (a mixin that itself mixes in another module).
-    //    Fall back to the BFS ancestor walk for depth > 1. Order is best-effort;
-    //    Ruby's actual MRO for transitive mixins is rare and this under-spec is
-    //    documented in plan 003's Deferred to Separate Tasks.
+    // Step 4: Transitive ancestors (a mixin that itself mixes in another module).
+    // Fall back to the BFS ancestor walk for depth > 1. Order is best-effort;
+    // Ruby's actual MRO for transitive mixins is rare and under-specified
+    // (documented in architecture docs as deferred work).
     for (const ancestorId of heritageMap.getAncestors(ownerNodeId)) {
       // Skip direct parents we already walked above.
       if (prependParents.includes(ancestorId)) continue;

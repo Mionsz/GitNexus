@@ -23,12 +23,11 @@
  *     of passing trivially on `Account`'s own method.
  *
  * Plan 003 adds the `'ruby-mixin'` MroStrategy and kind-aware ancestry
- * (prepend / include / extend split). The infrastructure is wired in
- * `lookupMethodByOwnerWithMRO` and applies whenever Ruby calls flow through
- * the owner-scoped `resolveMemberCall` path. Shadow-name assertion for
- * `call_serialize → PrependedOverride#serialize` is TODO-marked below because
- * Ruby bare-identifier calls inside methods (self-calls) currently take the
- * `resolveFreeCall` path which doesn't do MRO. See the TODO comment for detail.
+ * (prepend / include / extend split). Plan 005 (the call-resolution DAG)
+ * installs `inferImplicitReceiver` and `selectDispatch` provider hooks that
+ * let Ruby self-rewrite bare-identifier calls to `self.method` so they take
+ * the owner-scoped MRO path. The shadow-name assertion below exercises the
+ * full chain: Module→Trait relabel + kind-aware MRO + self-inference.
  *
  * Known guard limitation (documented residual): reverting plan 001 Unit 1
  * alone (the sequential prepass extractFromCall) does NOT make these tests
@@ -150,12 +149,40 @@ describe('Ruby mixin heritage: sequential vs worker parity', () => {
 
   it('sequential mode resolves prepend-only method: call_prepended_marker → PrependedOverride#prepended_marker', () => {
     // `prepended_marker` is defined ONLY on PrependedOverride — not on
-    // Account, Greetable, or LoggerMixin. A resolver that fails to enter
-    // the prepend provider into the MRO (regression in plan 001 Unit 1's
-    // sequential prepass OR Unit 2's module relabel) would not find this
-    // method at all, and the owner list would be empty.
+    // Account, Greetable, or LoggerMixin. Narrow guard for the prepend
+    // provider entering the MRO (plan 001 / plan 003).
     const owners = resolvedMethodOwners(sequential, 'call_prepended_marker', 'prepended_marker');
     expect(owners).toContain('PrependedOverride');
+  });
+
+  it('sequential mode resolves prepend shadow: call_serialize → PrependedOverride#serialize (not Account#serialize)', () => {
+    // `Account` defines `def serialize` AND `prepend PrependedOverride` which
+    // also defines `serialize`. Ruby MRO says the prepended module wins.
+    // This assertion exercises the full chain:
+    //   - Module→Trait relabel (plan 001 Unit 2) — PrependedOverride resolvable via lookupClassByName
+    //   - `'ruby-mixin'` MroStrategy (plan 003 Unit 3) — prepend walks before direct owner
+    //   - `inferImplicitReceiver` hook (plan 005 / DAG) — bare `serialize` call rewritten
+    //     as `self.serialize` so it takes the owner-scoped MRO path
+    // Reverting ANY of the three makes this assertion fail.
+    const owners = resolvedMethodOwners(sequential, 'call_serialize', 'serialize');
+    expect(owners).toContain('PrependedOverride');
+  });
+
+  it('sequential mode resolves extend-provided class method: Usage#run → LoggerMixin#log', () => {
+    // `Account extend LoggerMixin` means `LoggerMixin#log` is a CLASS method
+    // on `Account`. The fixture's `Usage#run` calls `Account.log("from Usage")`
+    // — a class-constant receiver, not an instance call. This exercises the
+    // `selectDispatch` hook's `receiverSource === 'class-as-receiver'` branch,
+    // which returns `ancestryView: 'singleton'` so the walker uses
+    // `getSingletonAncestry(Account)` = [LoggerMixin] instead of the instance
+    // MRO (which would have resolved nothing, since `log` is not an instance
+    // method on Account).
+    //
+    // Reverting the singleton branch in Ruby's selectDispatch (or dropping
+    // 'Trait'/'Class' from the class-as-receiver filter in call-processor)
+    // makes this assertion fail.
+    const owners = resolvedMethodOwners(sequential, 'run', 'log');
+    expect(owners).toContain('LoggerMixin');
   });
 
   // TODO(plan-003-followup): assert that prepend shadows self for

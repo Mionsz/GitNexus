@@ -1400,33 +1400,36 @@ const processFileGroup = (
     // Heritage edges (EXTENDS/IMPLEMENTS) are created by heritage-processor which runs
     // in PARALLEL with call-processor, so the graph edges don't exist when buildTypeEnv
     // runs. This pre-pass makes parent class information available for type resolution.
+    const provider = getProvider(language);
     const fileParentMap = new Map<string, string[]>();
-    for (const match of matches) {
-      const captureMap: Record<string, SyntaxNode> = {};
-      for (const c of match.captures) {
-        captureMap[c.name] = c.node;
-      }
-      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
-        const className: string = captureMap['heritage.class'].text;
-        const parentName: string = captureMap['heritage.extends'].text;
-        // Skip Go named fields (only anonymous fields are struct embedding)
-        const extendsNode = captureMap['heritage.extends'];
-        const fieldDecl = extendsNode.parent;
-        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name'))
-          continue;
-        let parents = fileParentMap.get(className);
-        if (!parents) {
-          parents = [];
-          fileParentMap.set(className, parents);
+    if (provider.heritageExtractor) {
+      for (const match of matches) {
+        const captureMap: Record<string, SyntaxNode> = {};
+        for (const c of match.captures) {
+          captureMap[c.name] = c.node;
         }
-        if (!parents.includes(parentName)) parents.push(parentName);
+        if (captureMap['heritage.class']) {
+          const heritageItems = provider.heritageExtractor.extract(captureMap, {
+            filePath: file.path,
+            language,
+          });
+          for (const item of heritageItems) {
+            if (item.kind === 'extends') {
+              let parents = fileParentMap.get(item.className);
+              if (!parents) {
+                parents = [];
+                fileParentMap.set(item.className, parents);
+              }
+              if (!parents.includes(item.parentName)) parents.push(item.parentName);
+            }
+          }
+        }
       }
     }
 
     // Build per-file type environment + constructor bindings in a single AST walk.
     // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
     const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
-    const provider = getProvider(language);
     const typeEnv = buildTypeEnv(tree, language, {
       parentMap,
       enclosingFunctionFinder: provider?.enclosingFunctionFinder,
@@ -1719,7 +1722,8 @@ const processFileGroup = (
               }
             }
 
-            // Dispatch: route language-specific calls (heritage, properties, imports)
+            // Dispatch: route language-specific calls (properties, imports)
+            // Heritage routing is handled by heritageExtractor.extractFromCall above.
             const routed = callRouter?.(calledName, captureMap['call']);
             if (routed) {
               if (routed.kind === 'skip') continue;
@@ -1730,18 +1734,6 @@ const processFileGroup = (
                   rawImportPath: routed.importPath,
                   language,
                 });
-                continue;
-              }
-
-              if (routed.kind === 'heritage') {
-                for (const item of routed.items) {
-                  result.heritage.push({
-                    filePath: file.path,
-                    className: item.enclosingClass,
-                    parentName: item.mixinName,
-                    kind: item.heritageKind,
-                  });
-                }
                 continue;
               }
 

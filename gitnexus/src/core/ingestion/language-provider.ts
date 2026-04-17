@@ -183,7 +183,8 @@ interface LanguageProviderConfig {
   /** Heritage extractor for extracting extends/implements/trait-impl relationships
    *  from tree-sitter @heritage.* captures and call-based heritage (e.g., Ruby
    *  include/extend/prepend). Produced by createHeritageExtractor() with a
-   *  per-language HeritageExtractionConfig. Default: undefined (inline fallback). */
+   *  per-language HeritageExtractionConfig.
+   *  All tree-sitter providers MUST supply this. */
   readonly heritageExtractor?: HeritageExtractor;
   /** Extract a semantic description for a definition node (e.g., PHP Eloquent
    *  property arrays, relation method descriptions).

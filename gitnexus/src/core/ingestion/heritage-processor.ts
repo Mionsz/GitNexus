@@ -32,6 +32,7 @@ import type {
 import { resolveExtendsType } from './model/heritage-map.js';
 import type { ResolutionContext } from './model/resolution-context.js';
 import { TIER_CONFIDENCE } from './model/resolution-context.js';
+import type { HeritageInfo } from './heritage-types.js';
 
 /**
  * Derive the heritage-resolution strategy for a language from its
@@ -81,6 +82,93 @@ const resolveHeritageId = (
     id: generateId(fallbackLabel, fallbackKey ?? name),
     confidence: TIER_CONFIDENCE['global'],
   };
+};
+
+/**
+ * Resolve a single HeritageInfo to a graph edge, using the same resolution
+ * logic as processHeritageFromExtracted.  This bridges the heritage extractor
+ * output format to the graph-resolution side.
+ */
+const resolveAndAddHeritageEdge = (
+  graph: KnowledgeGraph,
+  item: HeritageInfo,
+  filePath: string,
+  language: SupportedLanguages,
+  ctx: ResolutionContext,
+): void => {
+  if (item.kind === 'extends') {
+    const { type: relType, idPrefix } = resolveExtendsType(
+      item.parentName,
+      filePath,
+      ctx,
+      getHeritageStrategyForLanguage(language),
+    );
+
+    const child = resolveHeritageId(
+      item.className,
+      filePath,
+      ctx,
+      'Class',
+      `${filePath}:${item.className}`,
+    );
+    const parent = resolveHeritageId(item.parentName, filePath, ctx, idPrefix);
+
+    if (child.id && parent.id && child.id !== parent.id) {
+      graph.addRelationship({
+        id: generateId(relType, `${child.id}->${parent.id}`),
+        sourceId: child.id,
+        targetId: parent.id,
+        type: relType,
+        confidence: Math.sqrt(child.confidence * parent.confidence),
+        reason: '',
+      });
+    }
+  } else if (item.kind === 'implements') {
+    const cls = resolveHeritageId(
+      item.className,
+      filePath,
+      ctx,
+      'Class',
+      `${filePath}:${item.className}`,
+    );
+    const iface = resolveHeritageId(item.parentName, filePath, ctx, 'Interface');
+
+    if (cls.id && iface.id) {
+      graph.addRelationship({
+        id: generateId('IMPLEMENTS', `${cls.id}->${iface.id}`),
+        sourceId: cls.id,
+        targetId: iface.id,
+        type: 'IMPLEMENTS',
+        confidence: Math.sqrt(cls.confidence * iface.confidence),
+        reason: '',
+      });
+    }
+  } else if (
+    item.kind === 'trait-impl' ||
+    item.kind === 'include' ||
+    item.kind === 'extend' ||
+    item.kind === 'prepend'
+  ) {
+    const strct = resolveHeritageId(
+      item.className,
+      filePath,
+      ctx,
+      'Struct',
+      `${filePath}:${item.className}`,
+    );
+    const trait = resolveHeritageId(item.parentName, filePath, ctx, 'Trait');
+
+    if (strct.id && trait.id) {
+      graph.addRelationship({
+        id: generateId('IMPLEMENTS', `${strct.id}->${trait.id}:${item.kind}`),
+        sourceId: strct.id,
+        targetId: trait.id,
+        type: 'IMPLEMENTS',
+        confidence: Math.sqrt(strct.confidence * trait.confidence),
+        reason: item.kind,
+      });
+    }
+  }
 };
 
 export const processHeritage = async (
@@ -143,104 +231,24 @@ export const processHeritage = async (
       continue;
     }
 
-    // 4. Process heritage matches
+    // 4. Process heritage matches via provider heritage extractor
+    const heritageExtractor = provider.heritageExtractor;
     matches.forEach((match) => {
       const captureMap: Record<string, any> = {};
       match.captures.forEach((c) => {
         captureMap[c.name] = c.node;
       });
 
-      // EXTENDS or IMPLEMENTS: resolve via symbol table for languages where
-      // the tree-sitter query can't distinguish classes from interfaces (C#, Java)
-      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
-        // Go struct embedding: skip named fields (only anonymous fields are embedded)
-        const extendsNode = captureMap['heritage.extends'];
-        const fieldDecl = extendsNode.parent;
-        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name')) {
-          return; // Named field, not struct embedding
-        }
+      if (!captureMap['heritage.class']) return;
+      if (!heritageExtractor) return;
 
-        const className = captureMap['heritage.class'].text;
-        const parentClassName = captureMap['heritage.extends'].text;
+      const heritageItems = heritageExtractor.extract(captureMap, {
+        filePath: file.path,
+        language,
+      });
 
-        const { type: relType, idPrefix } = resolveExtendsType(
-          parentClassName,
-          file.path,
-          ctx,
-          getHeritageStrategyForLanguage(language),
-        );
-
-        const child = resolveHeritageId(
-          className,
-          file.path,
-          ctx,
-          'Class',
-          `${file.path}:${className}`,
-        );
-        const parent = resolveHeritageId(parentClassName, file.path, ctx, idPrefix);
-
-        if (child.id && parent.id && child.id !== parent.id) {
-          graph.addRelationship({
-            id: generateId(relType, `${child.id}->${parent.id}`),
-            sourceId: child.id,
-            targetId: parent.id,
-            type: relType,
-            confidence: Math.sqrt(child.confidence * parent.confidence),
-            reason: '',
-          });
-        }
-      }
-
-      // IMPLEMENTS: Class implements Interface (TypeScript only)
-      if (captureMap['heritage.class'] && captureMap['heritage.implements']) {
-        const className = captureMap['heritage.class'].text;
-        const interfaceName = captureMap['heritage.implements'].text;
-
-        const cls = resolveHeritageId(
-          className,
-          file.path,
-          ctx,
-          'Class',
-          `${file.path}:${className}`,
-        );
-        const iface = resolveHeritageId(interfaceName, file.path, ctx, 'Interface');
-
-        if (cls.id && iface.id) {
-          graph.addRelationship({
-            id: generateId('IMPLEMENTS', `${cls.id}->${iface.id}`),
-            sourceId: cls.id,
-            targetId: iface.id,
-            type: 'IMPLEMENTS',
-            confidence: Math.sqrt(cls.confidence * iface.confidence),
-            reason: '',
-          });
-        }
-      }
-
-      // IMPLEMENTS (Rust): impl Trait for Struct
-      if (captureMap['heritage.trait'] && captureMap['heritage.class']) {
-        const structName = captureMap['heritage.class'].text;
-        const traitName = captureMap['heritage.trait'].text;
-
-        const strct = resolveHeritageId(
-          structName,
-          file.path,
-          ctx,
-          'Struct',
-          `${file.path}:${structName}`,
-        );
-        const trait = resolveHeritageId(traitName, file.path, ctx, 'Trait');
-
-        if (strct.id && trait.id) {
-          graph.addRelationship({
-            id: generateId('IMPLEMENTS', `${strct.id}->${trait.id}`),
-            sourceId: strct.id,
-            targetId: trait.id,
-            type: 'IMPLEMENTS',
-            confidence: Math.sqrt(strct.confidence * trait.confidence),
-            reason: 'trait-impl',
-          });
-        }
+      for (const item of heritageItems) {
+        resolveAndAddHeritageEdge(graph, item, file.path, language, ctx);
       }
     });
 

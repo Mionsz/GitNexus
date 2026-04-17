@@ -26,6 +26,7 @@ import type {
 } from '../../src/core/ingestion/heritage-types.js';
 import type { CaptureMap } from '../../src/core/ingestion/language-provider.js';
 import { SupportedLanguages } from 'gitnexus-shared';
+import { getProvider } from '../../src/core/ingestion/languages/index.js';
 
 // ---------------------------------------------------------------------------
 // Mock AST node helpers
@@ -431,5 +432,35 @@ describe('HeritageExtraction language configs', () => {
 
   it('C# config has correct language', () => {
     expect(csharpHeritageConfig.language).toBe(SupportedLanguages.CSharp);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Provider wiring — every tree-sitter provider MUST have heritageExtractor
+// ---------------------------------------------------------------------------
+
+describe('heritageExtractor on LanguageProvider', () => {
+  it('all tree-sitter providers have heritageExtractor defined', () => {
+    const languages: SupportedLanguages[] = [
+      SupportedLanguages.TypeScript,
+      SupportedLanguages.JavaScript,
+      SupportedLanguages.Python,
+      SupportedLanguages.Java,
+      SupportedLanguages.Kotlin,
+      SupportedLanguages.Go,
+      SupportedLanguages.Rust,
+      SupportedLanguages.CSharp,
+      SupportedLanguages.C,
+      SupportedLanguages.CPlusPlus,
+      SupportedLanguages.PHP,
+      SupportedLanguages.Ruby,
+      SupportedLanguages.Swift,
+      SupportedLanguages.Dart,
+      SupportedLanguages.Vue,
+    ];
+    for (const lang of languages) {
+      const provider = getProvider(lang);
+      expect(provider.heritageExtractor, `${lang} should have a heritageExtractor`).toBeDefined();
+    }
   });
 });

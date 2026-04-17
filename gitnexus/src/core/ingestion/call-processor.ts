@@ -766,22 +766,26 @@ export const processCalls = async (
     // Extract heritage from query matches to build parentMap for buildTypeEnv.
     // Heritage-processor runs in PARALLEL, so graph edges don't exist when buildTypeEnv runs.
     const fileParentMap = new Map<string, string[]>();
-    for (const match of matches) {
-      const captureMap: Record<string, any> = {};
-      match.captures.forEach((c) => (captureMap[c.name] = c.node));
-      if (captureMap['heritage.class'] && captureMap['heritage.extends']) {
-        const className: string = captureMap['heritage.class'].text;
-        const parentName: string = captureMap['heritage.extends'].text;
-        const extendsNode = captureMap['heritage.extends'];
-        const fieldDecl = extendsNode.parent;
-        if (fieldDecl?.type === 'field_declaration' && fieldDecl.childForFieldName('name'))
-          continue;
-        let parents = fileParentMap.get(className);
-        if (!parents) {
-          parents = [];
-          fileParentMap.set(className, parents);
+    if (provider.heritageExtractor) {
+      for (const match of matches) {
+        const captureMap: Record<string, any> = {};
+        match.captures.forEach((c) => (captureMap[c.name] = c.node));
+        if (captureMap['heritage.class']) {
+          const heritageItems = provider.heritageExtractor.extract(captureMap, {
+            filePath: file.path,
+            language,
+          });
+          for (const item of heritageItems) {
+            if (item.kind === 'extends') {
+              let parents = fileParentMap.get(item.className);
+              if (!parents) {
+                parents = [];
+                fileParentMap.set(item.className, parents);
+              }
+              if (!parents.includes(item.parentName)) parents.push(item.parentName);
+            }
+          }
         }
-        if (!parents.includes(parentName)) parents.push(parentName);
       }
     }
     const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
@@ -991,22 +995,33 @@ export const processCalls = async (
 
       const calledName = nameNode.text;
 
+      // Check heritage extractor for call-based heritage (e.g., Ruby include/extend/prepend)
+      if (provider.heritageExtractor?.extractFromCall) {
+        const heritageItems = provider.heritageExtractor.extractFromCall(
+          calledName,
+          captureMap['call'],
+          { filePath: file.path, language },
+        );
+        if (heritageItems !== null) {
+          for (const item of heritageItems) {
+            collectedHeritage.push({
+              filePath: file.path,
+              className: item.className,
+              parentName: item.parentName,
+              kind: item.kind,
+            });
+          }
+          return;
+        }
+      }
+
+      // Dispatch: route language-specific calls (properties, imports)
+      // Heritage routing is handled by heritageExtractor.extractFromCall above.
       const routed = callRouter?.(calledName, captureMap['call']);
       if (routed) {
         switch (routed.kind) {
           case 'skip':
           case 'import':
-            return;
-
-          case 'heritage':
-            for (const item of routed.items) {
-              collectedHeritage.push({
-                filePath: file.path,
-                className: item.enclosingClass,
-                parentName: item.mixinName,
-                kind: item.heritageKind,
-              });
-            }
             return;
 
           case 'properties': {

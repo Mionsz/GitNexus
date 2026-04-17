@@ -30,6 +30,23 @@ import { rubyCallConfig } from '../call-extractors/configs/ruby.js';
 import { createHeritageExtractor } from '../heritage-extractors/generic.js';
 import { rubyHeritageConfig } from '../heritage-extractors/configs/ruby.js';
 
+/**
+ * Ruby label override. Applied to:
+ *   - `definition.module` captures in the structure phase — remaps to `Trait`
+ *     so Ruby modules are registered in the class-like type registry and are
+ *     therefore resolvable by `lookupClassByName` during mixin heritage
+ *     resolution (`include`/`extend`/`prepend`).
+ *   - `definition.function` captures — Ruby has no bare "function" construct
+ *     (top-level `def` is a method on `main`); return the default so generic
+ *     logic continues to apply.
+ *
+ * Returning `null` means "skip this definition"; we never do that here.
+ */
+const rubyLabelOverride = (_node: SyntaxNode, defaultLabel: NodeLabel): NodeLabel | null => {
+  if (defaultLabel === 'Module') return 'Trait';
+  return defaultLabel;
+};
+
 /** Ruby method/singleton_method: extract name from 'name' field, label as Method. */
 const rubyExtractFunctionName = (
   node: SyntaxNode,
@@ -140,5 +157,6 @@ export const rubyProvider = defineLanguage({
   variableExtractor: createVariableExtractor(rubyVariableConfig),
   classExtractor: createClassExtractor(rubyClassConfig),
   heritageExtractor: createHeritageExtractor(rubyHeritageConfig),
+  labelOverride: rubyLabelOverride,
   builtInNames: BUILT_INS,
 });

@@ -369,6 +369,15 @@ export const processHeritageFromExtracted = async (
  * {@link ExtractedHeritage} rows without mutating the graph. Used on the
  * sequential pipeline path so `buildHeritageMap(..., ctx)` can run before
  * `processCalls` (worker path defers calls until heritage from all chunks exists).
+ *
+ * This prepass extracts BOTH capture-based heritage (`@heritage.*` — extends /
+ * implements / trait-impl) AND call-based heritage (`@call.name` routed through
+ * `heritageExtractor.extractFromCall` — Ruby `include` / `extend` / `prepend`).
+ * Without the second pass, sequential-mode `sequentialHeritageMap` would not
+ * know about Ruby mixin ancestry before `processCalls` resolves calls against
+ * it, silently dropping mixed-in methods from the graph. This function stays
+ * read-only — `processCalls` still owns emission of heritage graph edges via
+ * its `rubyHeritage` return path.
  */
 export async function extractExtractedHeritageFromFiles(
   files: { path: string; content: string }[],
@@ -408,6 +417,8 @@ export async function extractExtractedHeritageFromFiles(
       continue;
     }
 
+    const callBasedEnabled = !!provider.heritageExtractor?.extractFromCall;
+
     for (const match of matches) {
       const captureMap: Record<string, any> = {};
       match.captures.forEach((c) => {
@@ -420,6 +431,31 @@ export async function extractExtractedHeritageFromFiles(
             filePath: file.path,
             language,
           });
+          for (const item of heritageItems) {
+            out.push({
+              filePath: file.path,
+              className: item.className,
+              parentName: item.parentName,
+              kind: item.kind,
+            });
+          }
+        }
+        continue;
+      }
+
+      // Call-based heritage (e.g. Ruby include/extend/prepend). Matches the
+      // routing the worker path performs inline in parse-worker.ts — see the
+      // `provider.heritageExtractor?.extractFromCall` branch there. We only
+      // need call-based records here; other @call captures are consumed by
+      // processCalls later in the sequential loop.
+      if (callBasedEnabled && captureMap['call'] && captureMap['call.name']) {
+        const calledName: string = captureMap['call.name'].text;
+        const heritageItems = provider.heritageExtractor!.extractFromCall!(
+          calledName,
+          captureMap['call'],
+          { filePath: file.path, language },
+        );
+        if (heritageItems) {
           for (const item of heritageItems) {
             out.push({
               filePath: file.path,

@@ -103,6 +103,12 @@ export interface AnalyzeResult {
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
 const EMBEDDING_NODE_LIMIT = 50_000;
 
+// Re-export the pure flag-derivation helper so external callers (and tests)
+// keep importing from this module's stable surface.
+export { deriveEmbeddingMode } from './embedding-mode.js';
+export type { EmbeddingMode } from './embedding-mode.js';
+import { deriveEmbeddingMode as _deriveEmbeddingMode } from './embedding-mode.js';
+
 export const PHASE_LABELS: Record<string, string> = {
   extracting: 'Scanning files',
   structure: 'Building structure',
@@ -187,19 +193,12 @@ export async function runFullAnalysis(
   let cachedEmbeddings: CachedEmbedding[] = [];
 
   const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
-  const forceRegenerateEmbeddings =
-    !!options.force &&
-    !options.embeddings &&
-    !options.dropEmbeddings &&
-    existingEmbeddingCount > 0;
-  const preserveExistingEmbeddings =
-    !options.embeddings &&
-    !options.dropEmbeddings &&
-    !forceRegenerateEmbeddings &&
-    existingEmbeddingCount > 0;
-  // Resolved generation flag — true when the caller asked for embeddings
-  // explicitly OR when --force is regenerating an already-embedded repo.
-  const shouldGenerateEmbeddings = !!options.embeddings || forceRegenerateEmbeddings;
+  const {
+    forceRegenerateEmbeddings,
+    preserveExistingEmbeddings,
+    shouldGenerateEmbeddings,
+    shouldLoadCache,
+  } = _deriveEmbeddingMode(options, existingEmbeddingCount);
 
   if (options.dropEmbeddings && existingEmbeddingCount > 0) {
     log(
@@ -220,7 +219,7 @@ export async function runFullAnalysis(
     );
   }
 
-  if ((shouldGenerateEmbeddings || preserveExistingEmbeddings) && existingMeta) {
+  if (shouldLoadCache && existingMeta) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       await initLbug(lbugPath);
@@ -228,7 +227,17 @@ export async function runFullAnalysis(
       cachedEmbeddingNodeIds = cached.embeddingNodeIds;
       cachedEmbeddings = cached.embeddings;
       await closeLbug();
-    } catch {
+    } catch (err: any) {
+      // Surface cache-load failures explicitly: silently swallowing here would
+      // re-introduce the original silent-data-loss symptom (embeddings end up
+      // at 0 in meta.json with no diagnostic) through a different door.
+      log(
+        `Warning: could not load cached embeddings ` +
+          `(${err?.message ?? String(err)}). ` +
+          `Embeddings will not be preserved on this run.`,
+      );
+      cachedEmbeddingNodeIds = new Set<string>();
+      cachedEmbeddings = [];
       try {
         await closeLbug();
       } catch {

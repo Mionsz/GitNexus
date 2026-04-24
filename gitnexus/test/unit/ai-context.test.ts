@@ -276,4 +276,22 @@ describe('generateAIContextFiles', () => {
       await fs.rm(crlfDir, { recursive: true, force: true });
     }
   });
+
+  it('emits AUTO-GENERATED notice immediately after gitnexus:start marker', async () => {
+    const stats = { nodes: 10, edges: 20, processes: 2 };
+    await generateAIContextFiles(tmpDir, storagePath, 'NoticeProject', stats);
+
+    for (const filename of ['AGENTS.md', 'CLAUDE.md']) {
+      const content = await fs.readFile(path.join(tmpDir, filename), 'utf-8');
+      const startIdx = content.indexOf('<!-- gitnexus:start -->');
+      expect(startIdx, `${filename} missing gitnexus:start marker`).toBeGreaterThanOrEqual(0);
+      const afterStart = content.slice(startIdx + '<!-- gitnexus:start -->'.length).trimStart();
+      expect(
+        afterStart.startsWith('<!-- AUTO-GENERATED'),
+        `${filename} does not begin with AUTO-GENERATED notice; got: ${afterStart.slice(0, 80)}`,
+      ).toBe(true);
+      expect(afterStart).toContain('Do NOT hand-edit');
+      expect(afterStart).toContain('npx gitnexus analyze');
+    }
+  });
 });

@@ -53,6 +53,15 @@ export interface AnalyzeOptions {
    */
   force?: boolean;
   embeddings?: boolean;
+  /**
+   * Explicitly drop any embeddings present in the existing index instead of
+   * preserving them. Only meaningful when `embeddings` is false/undefined:
+   * the default behavior in that case is to load the previously generated
+   * embeddings and re-insert them after the rebuild so a routine
+   * re-analyze does not silently wipe a long embedding pass (#issue: analyze
+   * silently wipes existing embeddings when run without --embeddings).
+   */
+  dropEmbeddings?: boolean;
   skipGit?: boolean;
   /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
   skipAgentsMd?: boolean;
@@ -160,10 +169,36 @@ export async function runFullAnalysis(
   }
 
   // ── Cache embeddings from existing index before rebuild ────────────
+  // Three modes:
+  //   --embeddings              -> load cache, restore, then generate any new ones
+  //   (default)                 -> if existing index has embeddings, preserve them
+  //                                (load + restore, but do not generate); otherwise no-op
+  //   --drop-embeddings         -> skip cache load entirely; rebuild wipes embeddings
+  //
+  // The default-preserve branch is what makes a routine `analyze` (e.g. a
+  // post-commit hook) safe: a multi-minute embedding pass is no longer
+  // silently dropped just because the caller omitted `--embeddings`.
   let cachedEmbeddingNodeIds = new Set<string>();
   let cachedEmbeddings: CachedEmbedding[] = [];
 
-  if (options.embeddings && existingMeta && !options.force) {
+  const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
+  const preserveExistingEmbeddings =
+    !options.embeddings && !options.dropEmbeddings && existingEmbeddingCount > 0;
+
+  if (options.dropEmbeddings && existingEmbeddingCount > 0) {
+    log(
+      `Dropping ${existingEmbeddingCount} existing embeddings (--drop-embeddings). ` +
+        `Re-run with --embeddings to regenerate.`,
+    );
+  } else if (preserveExistingEmbeddings) {
+    log(
+      `Preserving ${existingEmbeddingCount} existing embeddings. ` +
+        `Pass --embeddings to also generate embeddings for new/changed nodes, ` +
+        `or --drop-embeddings to wipe them.`,
+    );
+  }
+
+  if ((options.embeddings || preserveExistingEmbeddings) && existingMeta) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       await initLbug(lbugPath);

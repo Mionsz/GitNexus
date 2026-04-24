@@ -169,8 +169,13 @@ export async function runFullAnalysis(
   }
 
   // ── Cache embeddings from existing index before rebuild ────────────
-  // Three modes:
+  // Four modes:
   //   --embeddings              -> load cache, restore, then generate any new ones
+  //   --force (with existing
+  //    embeddings)              -> auto-imply --embeddings: load cache, restore,
+  //                                regenerate embeddings for new/changed nodes
+  //                                (a forced re-index of an embedded repo
+  //                                shouldn't quietly downgrade to "preserve only")
   //   (default)                 -> if existing index has embeddings, preserve them
   //                                (load + restore, but do not generate); otherwise no-op
   //   --drop-embeddings         -> skip cache load entirely; rebuild wipes embeddings
@@ -182,13 +187,30 @@ export async function runFullAnalysis(
   let cachedEmbeddings: CachedEmbedding[] = [];
 
   const existingEmbeddingCount = existingMeta?.stats?.embeddings ?? 0;
+  const forceRegenerateEmbeddings =
+    !!options.force &&
+    !options.embeddings &&
+    !options.dropEmbeddings &&
+    existingEmbeddingCount > 0;
   const preserveExistingEmbeddings =
-    !options.embeddings && !options.dropEmbeddings && existingEmbeddingCount > 0;
+    !options.embeddings &&
+    !options.dropEmbeddings &&
+    !forceRegenerateEmbeddings &&
+    existingEmbeddingCount > 0;
+  // Resolved generation flag — true when the caller asked for embeddings
+  // explicitly OR when --force is regenerating an already-embedded repo.
+  const shouldGenerateEmbeddings = !!options.embeddings || forceRegenerateEmbeddings;
 
   if (options.dropEmbeddings && existingEmbeddingCount > 0) {
     log(
       `Dropping ${existingEmbeddingCount} existing embeddings (--drop-embeddings). ` +
         `Re-run with --embeddings to regenerate.`,
+    );
+  } else if (forceRegenerateEmbeddings) {
+    log(
+      `--force on a repo with ${existingEmbeddingCount} existing embeddings: ` +
+        `regenerating embeddings for new/changed nodes. ` +
+        `Pass --drop-embeddings to wipe them instead.`,
     );
   } else if (preserveExistingEmbeddings) {
     log(
@@ -198,7 +220,7 @@ export async function runFullAnalysis(
     );
   }
 
-  if ((options.embeddings || preserveExistingEmbeddings) && existingMeta) {
+  if ((shouldGenerateEmbeddings || preserveExistingEmbeddings) && existingMeta) {
     try {
       progress('embeddings', 0, 'Caching embeddings...');
       await initLbug(lbugPath);
@@ -288,7 +310,7 @@ export async function runFullAnalysis(
     const stats = await getLbugStats();
     let embeddingSkipped = true;
 
-    if (options.embeddings) {
+    if (shouldGenerateEmbeddings) {
       if (stats.nodes <= EMBEDDING_NODE_LIMIT) {
         embeddingSkipped = false;
       }
